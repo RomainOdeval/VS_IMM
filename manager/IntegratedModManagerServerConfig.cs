@@ -25,6 +25,15 @@ public enum ImmImportantInformationHighlight
 	Disabled
 }
 
+
+[JsonConverter(typeof(StringEnumConverter))]
+public enum ImmUpdateManagementMode
+{
+	Manual,
+	AutomaticCheck,
+	AutomaticUpdate
+}
+
 public sealed class IntegratedModManagerConfig
 {
 	public const string FileName = "integratedmodmanager/integratedmodmanager.json";
@@ -34,8 +43,9 @@ public sealed class IntegratedModManagerConfig
 
 	public bool ShowNonConfigurableMods = false;
 	public int ModSelectorRows = 3;
-	public ImmNudgeBehaviour NudgeBehaviour = ImmNudgeBehaviour.FirstTime;
+	public ImmNudgeBehaviour NudgeBehaviour = ImmNudgeBehaviour.WhenErrorsFound;
 	public ImmImportantInformationHighlight ImportantInformationHighlight = ImmImportantInformationHighlight.Pulsating;
+	public ImmUpdateManagementMode UpdateManagement = ImmUpdateManagementMode.Manual;
 
 	public static bool ShouldShowNonConfigurableMods => Current.ShowNonConfigurableMods;
 
@@ -44,6 +54,24 @@ public sealed class IntegratedModManagerConfig
 	public static ImmNudgeBehaviour ConfiguredNudgeBehaviour => Current.NudgeBehaviour;
 
 	public static ImmImportantInformationHighlight ConfiguredInformationHighlight => Current.ImportantInformationHighlight;
+
+	public static IntegratedModManagerConfig LoadOrCreate(ICoreAPI api)
+	{
+		try
+		{
+			IntegratedModManagerConfig config = api.LoadModConfig<IntegratedModManagerConfig>(FileName) ?? new IntegratedModManagerConfig();
+
+			config.ModSelectorRows = Math.Clamp(config.ModSelectorRows, 1, 6);
+			api.StoreModConfig(config, FileName);
+
+			return config;
+		}
+		catch (Exception exception)
+		{
+			api.Logger.Error("[integratedmodmanager] Failed to initialize IMM config: {0}", exception.Message);
+			return new IntegratedModManagerConfig();
+		}
+	}
 
 	public static void Start(ICoreClientAPI api)
 	{
@@ -76,16 +104,5 @@ public sealed class IntegratedModManagerConfig
 		catch (Exception exception) { Api.Logger.Error("[integratedmodmanager] Failed to reload client config: {0}", exception.Message); }
 	}
 
-	private static void EnsureExists(ICoreClientAPI api)
-	{
-		try
-		{
-			IntegratedModManagerConfig config = api.LoadModConfig<IntegratedModManagerConfig>(FileName) ?? new IntegratedModManagerConfig();
-
-			config.ModSelectorRows = Math.Clamp(config.ModSelectorRows, 1, 6);
-
-			api.StoreModConfig(config, FileName);
-		}
-		catch (Exception exception) { api.Logger.Error("[integratedmodmanager] Failed to initialize client config: {0}", exception.Message); }
-	}
+	private static void EnsureExists(ICoreClientAPI api) { LoadOrCreate(api); }
 }

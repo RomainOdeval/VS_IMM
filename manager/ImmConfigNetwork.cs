@@ -200,7 +200,7 @@ public sealed class ImmConfigClient : IDisposable
 
 		if (externalManagers?.IsControlled(modId) == true)
 		{
-			page = new ImmConfigPageResponse { Success = true, CanManageServer = CanManageServer, ModId = modId, Configuration = Array.Empty<ImmConfigBlockPacket>(), Dependencies = Array.Empty<ImmDependencyPacket>(), ConfigurationExternallyManaged = true, ExternalManagerActive = externalManagers.AnyManagerActive };
+			page = new ImmConfigPageResponse { Success = true, CanManageServer = CanManageServer, ModId = modId, Configuration = Array.Empty<ImmConfigBlockPacket>(), Dependencies = Array.Empty<ImmDependencyPacket>(), ConfigurationExternallyManaged = true, ExternalManagerActive = externalManagers.AnyManagerActive, ExternalManagerName = externalManagers.GetPrimaryManagerName(ClientApi, modId) };
 			return true;
 		}
 
@@ -305,7 +305,11 @@ public sealed class ImmConfigClient : IDisposable
 		{
 			ImmExternalManagerOwnership? externalManagers = PatchCoordinator?.ExternalManagers;
 
-			packet.ConfigurationExternallyManaged |= externalManagers?.IsControlled(packet.ModId) == true;
+			bool locallyControlled = externalManagers?.IsControlled(packet.ModId) == true;
+
+			if (locallyControlled && string.IsNullOrWhiteSpace(packet.ExternalManagerName)) { packet.ExternalManagerName = externalManagers!.GetPrimaryManagerName(ClientApi, packet.ModId); }
+
+			packet.ConfigurationExternallyManaged |= locallyControlled;
 			packet.ExternalManagerActive |= externalManagers?.AnyManagerActive == true;
 
 			if (packet.ConfigurationExternallyManaged) { packet.Configuration = Array.Empty<ImmConfigBlockPacket>(); }
@@ -558,6 +562,7 @@ public sealed class ImmConfigPageResponse
 	[ProtoMember(6)] public bool CanManageServer;
 	[ProtoMember(7)] public bool ConfigurationExternallyManaged;
 	[ProtoMember(8)] public bool ExternalManagerActive;
+	[ProtoMember(9)] public string ExternalManagerName = "";
 }
 
 [ProtoContract]

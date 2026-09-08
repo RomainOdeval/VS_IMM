@@ -4,13 +4,13 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Text.RegularExpressions;
 using Cairo;
 using IntegratedModManager.Config;
 using IntegratedModManager.UI;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Vintagestory.API.Client;
+using Vintagestory.API.Common;
 using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
 
@@ -54,7 +54,9 @@ public sealed class GuiDialogModManager : GuiDialog
 	private const double DependencyRestartGap = 5;
 	private const double DependencyRestartTextHeight = 24;
 
-	private static readonly Regex BreakTagRegex = new(@"<br\s*/?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+	private const int SearchDebounceMs = 250;
+	private const double SearchHeight = 30;
+	private const double SearchGap = 10;
 
 	private readonly ImmConfigClient ConfigClient;
 	private readonly GuiDialogNotification Notification;
@@ -63,14 +65,16 @@ public sealed class GuiDialogModManager : GuiDialog
 	private readonly Dictionary<int, string> PendingChanges = new();
 	private readonly Dictionary<int, string> OriginalValues = new();
 	private readonly HashSet<int> InvalidInputs = new();
+	private readonly Dictionary<int, string> InvalidInputValues = new();
 	private readonly Dictionary<int, GuiElement> ControlElements = new();
-	private readonly HashSet<int> PendingRestartDependencyIds = new();
+	private readonly Dictionary<int, PendingRestartDependency> PendingRestartDependencies = new();
 
 	private Dictionary<int, string>? ApplyingChanges;
 	private ImmConfigPageResponse? Page;
 
 	private string SelectedModId = "";
 	private string SelectedModName = "";
+	private string SearchText = "";
 
 	private ElementBounds? ContentClipBounds;
 	private GuiElementContainer? ConfigContainer;
@@ -80,6 +84,7 @@ public sealed class GuiDialogModManager : GuiDialog
 	private bool NeedScrollbar;
 	private bool Applying;
 	private bool SettingControlValues;
+	private bool SettingSearchValue;
 	private bool ClientChangesSavedDuringApply;
 	private ImmReloadRequirement ClientReloadRequirementDuringApply = ImmReloadRequirement.None;
 	private bool RefreshingAfterResolution;
@@ -87,6 +92,7 @@ public sealed class GuiDialogModManager : GuiDialog
 	private string StatusMessage = "";
 	private int ActiveTab;
 	private int ResolvingDependencyId = -1;
+	private long SearchCallbackId = -1;
 
 	private double DependencyTabOffset;
 	private double DependencyTabWidth;
@@ -172,6 +178,21 @@ public sealed class GuiDialogModManager : GuiDialog
 		return dependencies.Any(dependency => dependency.Severity == ImmDependencySeverity.Warning) ? ImmDiagnosticLevel.Warning : ImmDiagnosticLevel.None;
 	}
 
+	public override void OnKeyDown(KeyEvent args)
+	{
+		GuiElementTextInput? searchInput = SingleComposer?.GetElement("configsearch") as GuiElementTextInput;
+
+		if (searchInput?.HasFocus == true && (args.KeyCode == (int)GlKeys.Enter || args.KeyCode == (int)GlKeys.KeypadEnter))
+		{
+			CancelPendingSearch();
+			ApplySearch();
+			args.Handled = true;
+			return;
+		}
+
+		base.OnKeyDown(args);
+	}
+
 	public override void OnMouseWheel(MouseWheelEventArgs args)
 	{
 		if (NeedScrollbar && ContentClipBounds != null && ContentClipBounds.PointInside(capi.Input.MouseX, capi.Input.MouseY))
@@ -185,7 +206,7 @@ public sealed class GuiDialogModManager : GuiDialog
 		base.OnMouseWheel(args);
 	}
 
-	private void OnLevelFinalize() { PendingRestartDependencyIds.Clear(); }
+	private void OnLevelFinalize() { PendingRestartDependencies.Clear(); }
 
 	private void ResetState()
 	{
@@ -193,6 +214,10 @@ public sealed class GuiDialogModManager : GuiDialog
 		PendingChanges.Clear();
 		OriginalValues.Clear();
 		InvalidInputs.Clear();
+		InvalidInputValues.Clear();
+		SearchText = "";
+		SettingSearchValue = false;
+		CancelPendingSearch();
 		ApplyingChanges = null;
 		Applying = false;
 		ClientChangesSavedDuringApply = false;
@@ -218,12 +243,14 @@ public sealed class GuiDialogModManager : GuiDialog
 
 		RefreshingAfterResolution = false;
 		RefreshingAfterApply = false;
+		RestorePendingRestartDependencies(packet);
 		Page = packet;
 		HighlightMode = IntegratedModManagerConfig.ConfiguredInformationHighlight;
 		PendingChanges.Clear();
 		OriginalValues.Clear();
 		CaptureOriginalValues();
 		InvalidInputs.Clear();
+		InvalidInputValues.Clear();
 		ApplyingChanges = null;
 		Applying = false;
 		ClientChangesSavedDuringApply = false;
@@ -302,7 +329,7 @@ public sealed class GuiDialogModManager : GuiDialog
 
 		ShowResolutionWarning(packet.Warning);
 
-		PendingRestartDependencyIds.Add(packet.RuntimeId);
+		MarkEquivalentDependenciesPendingRestart(packet.RuntimeId, resolvedDependency);
 		RefreshingAfterResolution = true;
 
 		ConfigClient.RequestPage(SelectedModId);
@@ -312,8 +339,112 @@ public sealed class GuiDialogModManager : GuiDialog
 		Compose();
 	}
 
+	private void MarkEquivalentDependenciesPendingRestart(int runtimeId, ImmDependencyPacket? resolvedDependency)
+	{
+		string sourceModId = Page?.ModId ?? SelectedModId;
+
+		PendingRestartDependencies[runtimeId] = new PendingRestartDependency(sourceModId, resolvedDependency);
+
+		if (resolvedDependency == null) { return; }
+
+		foreach (ImmDependencyPacket dependency in Page?.Dependencies ?? Array.Empty<ImmDependencyPacket>())
+		{
+			if (dependency.RuntimeId == runtimeId || !HasSameResolutionOutcome(sourceModId, resolvedDependency, dependency)) { continue; }
+			PendingRestartDependencies[dependency.RuntimeId] = new PendingRestartDependency(sourceModId, dependency);
+		}
+	}
+
+	private void RestorePendingRestartDependencies(ImmConfigPageResponse packet)
+	{
+		if (!packet.Success || !packet.CanManageServer) { return; }
+
+		List<ImmDependencyPacket> dependencies = (packet.Dependencies ?? Array.Empty<ImmDependencyPacket>()).ToList();
+		HashSet<int> runtimeIds = dependencies.Select(dependency => dependency.RuntimeId).ToHashSet();
+
+		foreach (KeyValuePair<int, PendingRestartDependency> pair in PendingRestartDependencies)
+		{
+			PendingRestartDependency pending = pair.Value;
+
+			if (!string.Equals(pending.ModId, packet.ModId, StringComparison.OrdinalIgnoreCase) || pending.Snapshot == null || !runtimeIds.Add(pair.Key)) { continue; }
+			dependencies.Add(pending.Snapshot);
+		}
+
+		packet.Dependencies = dependencies.ToArray();
+	}
+
+	private static bool HasSameResolutionOutcome(string sourceModId, ImmDependencyPacket left, ImmDependencyPacket right)
+	{
+		if (!left.HasResolution || !right.HasResolution || left.ResolutionType != right.ResolutionType) { return false; }
+
+		string[] leftArgs = left.ResolutionDescriptionArgs ?? Array.Empty<string>();
+		string[] rightArgs = right.ResolutionDescriptionArgs ?? Array.Empty<string>();
+
+		switch (left.ResolutionType)
+		{
+			case ImmDependencyResolutionType.InstallMod: return leftArgs.Length == 1 && rightArgs.Length == 1 && string.Equals(leftArgs[0], rightArgs[0], StringComparison.OrdinalIgnoreCase);
+
+			case ImmDependencyResolutionType.RunCommand: return leftArgs.Length == 1 && rightArgs.Length == 1 && string.Equals(leftArgs[0], rightArgs[0], StringComparison.Ordinal);
+
+			case ImmDependencyResolutionType.SetSetting:
+				if (!string.Equals(left.ResolutionDescriptionKey, right.ResolutionDescriptionKey, StringComparison.Ordinal)) { return false; }
+
+				if (string.Equals(left.ResolutionDescriptionKey, "resolution-set-modconfig", StringComparison.Ordinal))
+				{
+					return leftArgs.Length == 3 && rightArgs.Length == 3
+						&& string.Equals(leftArgs[0], rightArgs[0], StringComparison.Ordinal)
+						&& string.Equals(leftArgs[1], rightArgs[1], StringComparison.Ordinal)
+						&& string.Equals(leftArgs[2], rightArgs[2], StringComparison.Ordinal);
+				}
+
+				if (string.Equals(left.ResolutionDescriptionKey, "resolution-set-patchsetting", StringComparison.Ordinal))
+				{
+					return TryGetPatchSettingResolution(sourceModId, leftArgs, out string leftModId, out string leftPatchSetting, out string leftValue)
+						&& TryGetPatchSettingResolution(sourceModId, rightArgs, out string rightModId, out string rightPatchSetting, out string rightValue)
+						&& string.Equals(leftModId, rightModId, StringComparison.OrdinalIgnoreCase)
+						&& string.Equals(leftPatchSetting, rightPatchSetting, StringComparison.Ordinal)
+						&& string.Equals(leftValue, rightValue, StringComparison.Ordinal);
+				}
+			return false;
+
+			default: return false;
+		}
+	}
+
+	private static bool TryGetPatchSettingResolution(string sourceModId, string[] args, out string modId, out string patchSetting, out string value)
+	{
+		modId = "";
+		patchSetting = "";
+		value = "";
+
+		if (args.Length != 2 || string.IsNullOrWhiteSpace(args[0])) { return false; }
+
+		string target = args[0];
+		int separatorIndex = target.IndexOf(':');
+
+		if (separatorIndex < 0)
+		{
+			modId = sourceModId;
+			patchSetting = target;
+		}
+		else
+		{
+			if (separatorIndex == 0 || separatorIndex == target.Length - 1) { return false; }
+
+			modId = target[..separatorIndex];
+			patchSetting = target[(separatorIndex + 1)..];
+		}
+
+		value = args[1];
+		return true;
+	}
+
 	private void Compose()
 	{
+		GuiElementTextInput? previousSearchInput = SingleComposer?.GetElement("configsearch") as GuiElementTextInput;
+		bool restoreSearchFocus = previousSearchInput?.HasFocus == true;
+		int previousSearchCaret = previousSearchInput?.CaretPosWithoutLineBreaks ?? SearchText.Length;
+		CancelPendingSearch();
+
 		LastFrameWidth = capi.Render.FrameWidth;
 		LastFrameHeight = capi.Render.FrameHeight;
 
@@ -325,13 +456,10 @@ public sealed class GuiDialogModManager : GuiDialog
 		double screenHeight = capi.Render.FrameHeight / guiScale;
 
 		double width = Math.Min(PreferredWidth, Math.Max(300, screenWidth - ScreenMargin * 2));
-
 		double height = Math.Min(PreferredHeight, Math.Max(360, screenHeight - ScreenMargin * 2));
 
 		ElementBounds dialogBounds = ElementBounds.Fixed(0, 0, width, height).WithAlignment(EnumDialogArea.CenterMiddle);
-
 		ElementBounds titleBounds = ElementBounds.Fixed(PanelPadding, 14, width - PanelPadding * 2, 28);
-
 		ElementBounds tabsBounds = ElementBounds.Fixed(PanelPadding, 46, width - PanelPadding * 2, TabsHeight);
 
 		double buttonsY = height - BottomPadding - ButtonHeight;
@@ -339,7 +467,6 @@ public sealed class GuiDialogModManager : GuiDialog
 		double statusY = buttonsY - 28;
 		double contentY = 82;
 		double contentBottom = statusY - 10;
-		double visibleHeight = Math.Max(100, contentBottom - contentY);
 
 		bool canManageServer = Page?.CanManageServer == true;
 		bool configurationExternallyManaged = Page?.Success == true && Page.ConfigurationExternallyManaged;
@@ -347,21 +474,23 @@ public sealed class GuiDialogModManager : GuiDialog
 		if (!canManageServer) { ActiveTab = 0; }
 
 		bool showingDependencies = canManageServer && ActiveTab == 1;
+		bool showSearch = Page?.Success == true && !showingDependencies && !configurationExternallyManaged;
+		double listY = contentY + (showSearch ? SearchHeight + SearchGap : 0);
+		double contentPanelHeight = Math.Max(100, contentBottom - contentY);
+		double visibleHeight = Math.Max(100, contentBottom - listY);
+		string searchQuery = SearchText.Trim();
 
 		ImmConfigBlockPacket[] blocks = GetBlocks();
-
 		ImmDependencyPacket[] dependencyIssues = GetDependencies();
 
 		double availableContentWidth = width - PanelPadding * 2;
 
-		List<BlockLayout> layouts = showingDependencies ? new List<BlockLayout>() : BuildLayouts(blocks, availableContentWidth - 8);
-
+		List<BlockLayout> layouts = showingDependencies ? new List<BlockLayout>() : BuildLayouts(blocks, availableContentWidth - 8, searchQuery);
 		List<DependencyLayout> dependencyLayouts = showingDependencies ? BuildDependencyLayouts(dependencyIssues, availableContentWidth - 8) : new List<DependencyLayout>();
 
 		double calculatedHeight = showingDependencies ? dependencyLayouts.Count == 0 ? 40 : dependencyLayouts[^1].Bottom + 4 : layouts.Count == 0 ? 40 : layouts[^1].Bottom + 4;
 
 		ContentHeight = (float)Math.Max(visibleHeight, calculatedHeight);
-
 		NeedScrollbar = Page?.Success == true && ContentHeight > visibleHeight + 1;
 
 		double contentWidth = availableContentWidth - (NeedScrollbar ? ScrollbarWidth + ScrollbarGap : 0);
@@ -371,12 +500,11 @@ public sealed class GuiDialogModManager : GuiDialog
 			if (showingDependencies)
 			{
 				dependencyLayouts = BuildDependencyLayouts(dependencyIssues, contentWidth - 8);
-
 				calculatedHeight = dependencyLayouts.Count == 0 ? 40 : dependencyLayouts[^1].Bottom + 4;
 			}
 			else
 			{
-				layouts = BuildLayouts(blocks, contentWidth - 8);
+				layouts = BuildLayouts(blocks, contentWidth - 8, searchQuery);
 
 				calculatedHeight = layouts.Count == 0 ? 40 : layouts[^1].Bottom + 4;
 			}
@@ -386,13 +514,14 @@ public sealed class GuiDialogModManager : GuiDialog
 
 		ScrollValue = Math.Clamp(ScrollValue, 0, Math.Max(0, ContentHeight - (float)visibleHeight));
 
-		ContentClipBounds = ElementBounds.Fixed(PanelPadding, contentY, contentWidth, visibleHeight);
+		ContentClipBounds = ElementBounds.Fixed(PanelPadding, listY, contentWidth, visibleHeight);
 
 		ElementBounds listBounds = ElementBounds.Fixed(0, -ScrollValue, contentWidth, ContentHeight);
 
-		ElementBounds contentPanelBounds = ElementBounds.Fixed(PanelPadding - 8, contentY - 8, width - PanelPadding * 2 + 16, visibleHeight + 16);
+		ElementBounds contentPanelBounds = ElementBounds.Fixed(PanelPadding - 8, contentY - 8, width - PanelPadding * 2 + 16, contentPanelHeight + 16);
+		ElementBounds searchBounds = ElementBounds.Fixed(PanelPadding + 4, contentY, availableContentWidth - 8, SearchHeight);
 
-		ElementBounds scrollbarBounds = ElementBounds.Fixed(PanelPadding + contentWidth + ScrollbarGap, contentY, ScrollbarWidth, visibleHeight).WithFixedPadding(2);
+		ElementBounds scrollbarBounds = ElementBounds.Fixed(PanelPadding + contentWidth + ScrollbarGap, listY, ScrollbarWidth, visibleHeight).WithFixedPadding(2);
 
 		bool showApplyButton = !showingDependencies && !configurationExternallyManaged;
 		double buttonsWidth = showApplyButton ? ButtonWidth * 2 + ButtonGap : ButtonWidth;
@@ -400,27 +529,24 @@ public sealed class GuiDialogModManager : GuiDialog
 		double buttonsX = (width - buttonsWidth) / 2;
 
 		ElementBounds applyBounds = ElementBounds.Fixed(buttonsX, buttonsY, ButtonWidth, ButtonHeight);
-
 		ElementBounds closeBounds = ElementBounds.Fixed(showApplyButton ? buttonsX + ButtonWidth + ButtonGap : buttonsX, buttonsY, ButtonWidth, ButtonHeight);
-
 		ElementBounds statusBounds = ElementBounds.Fixed(PanelPadding, statusY, width - PanelPadding * 2, 20);
 
 		SingleComposer?.Dispose();
 
 		string titleText = GetSelectedModName();
 		CairoFont titleFont = CreateSingleLineTitleFont(titleText, titleBounds);
-
 		CairoFont tabFont = CairoFont.WhiteSmallText().WithWeight(FontWeight.Bold);
-
 		CairoFont selectedTabFont = CairoFont.WhiteSmallText().WithWeight(FontWeight.Bold).WithColor(GuiStyle.ActiveButtonTextColor);
 
 		string configurationTabText = ImmLocalization.Get("tab-configuration");
-
 		string dependenciesTabText = ImmLocalization.Get("tab-dependencies");
 
 		GuiTab[] managerTabDefinitions = canManageServer ? new[] { new GuiTab { Name = configurationTabText, DataInt = 0 }, new GuiTab { Name = dependenciesTabText, DataInt = 1 } } : new[] { new GuiTab { Name = configurationTabText, DataInt = 0 } };
 
 		GuiComposer composer = capi.Gui.CreateCompo("integratedmodmanager-modmanager", dialogBounds).AddShadedDialogBG(ElementBounds.Fill, withTitleBar: false).AddStaticText(titleText, titleFont, titleBounds).AddHorizontalTabs(managerTabDefinitions, tabsBounds, OnManagerTabClicked, tabFont, selectedTabFont, "managertabs").AddInset(contentPanelBounds, depth: 4, brightness: 0.85f);
+
+		if (showSearch) { composer.AddInteractiveElement(new GuiElementImmSearchInput(capi, searchBounds, OnSearchTextChanged, CairoFont.TextInput()), "configsearch"); }
 
 		GuiElementHorizontalTabs managerTabs = composer.GetHorizontalTabs("managertabs");
 
@@ -429,9 +555,7 @@ public sealed class GuiDialogModManager : GuiDialog
 		managerTabs.activeElement = ActiveTab;
 
 		double tabPadding = GuiElement.scaled(managerTabs.unscaledTabPadding);
-
 		double tabSpacing = GuiElement.scaled(managerTabs.unscaledTabSpacing);
-
 		double configurationTabWidth = (int)(tabFont.GetTextExtents(configurationTabText).Width + 2 * tabPadding + 1);
 
 		if (canManageServer)
@@ -453,7 +577,10 @@ public sealed class GuiDialogModManager : GuiDialog
 		{
 			if (configurationExternallyManaged && !showingDependencies)
 			{
-				composer.AddStaticText(ImmLocalization.Get("configuration-external-manager-controlled"), CairoFont.WhiteSmallText(), ElementBounds.Fixed(PanelPadding + 4, contentY + 4, contentWidth - 8, visibleHeight - 8));
+				string message = ImmLocalization.Get("configuration-external-manager-controlled");
+				if (!string.IsNullOrWhiteSpace(Page?.ExternalManagerName)) { message += ImmLocalization.Get("configuration-external-manager-controlled-by", Page.ExternalManagerName); }
+
+				composer.AddStaticText(message, CairoFont.WhiteSmallText(), ElementBounds.Fixed(PanelPadding + 4, contentY + 4, contentWidth - 8, visibleHeight - 8));
 			}
 			else
 			{
@@ -463,7 +590,6 @@ public sealed class GuiDialogModManager : GuiDialog
 				else { PopulateContainer(ConfigContainer, layouts, contentWidth); }
 
 				ConfigContainer.Tabbable = ConfigContainer.Elements.Any(element => element.Focusable);
-
 				composer.BeginClip(ContentClipBounds).AddInteractiveElement(ConfigContainer, "managerlist").EndClip();
 
 				if (NeedScrollbar) { composer.AddVerticalScrollbar(OnScrollbarChanged, scrollbarBounds, "configscroll"); }
@@ -472,17 +598,31 @@ public sealed class GuiDialogModManager : GuiDialog
 		else
 		{
 			string message = Page == null ? ImmLocalization.Get("status-loading") : Page.Error ?? ImmLocalization.Get("error-load-manager-data");
-
 			composer.AddStaticText(message, CairoFont.WhiteSmallText(), ElementBounds.Fixed(PanelPadding + 4, contentY + 4, contentWidth - 8, visibleHeight - 8));
 		}
 
 		composer.AddStaticText(StatusMessage, CairoFont.WhiteDetailText(), statusBounds);
 
 		if (showApplyButton) { composer.AddSmallButton(Applying ? ImmLocalization.Get("button-saving") : ImmLocalization.Get("button-apply"), OnApplyClicked, applyBounds, key: "apply"); }
-
 		composer.AddSmallButton(ImmLocalization.Get("button-close"), OnCloseClicked, closeBounds);
 
 		SingleComposer = composer.Compose();
+
+		if (showSearch)
+		{
+			GuiElementTextInput searchInput = SingleComposer.GetTextInput("configsearch");
+			searchInput.SetPlaceHolderText(ImmLocalization.Get("manager-search-placeholder"));
+
+			SettingSearchValue = true;
+			searchInput.SetValue(SearchText);
+			SettingSearchValue = false;
+
+			if (restoreSearchFocus)
+			{
+				searchInput.SetCaretPos(Math.Min(previousSearchCaret, SearchText.Length));
+				SingleComposer.FocusElement(searchInput.TabIndex);
+			}
+		}
 
 		managerTabs.Bounds.CalcWorldBounds();
 
@@ -513,9 +653,7 @@ public sealed class GuiDialogModManager : GuiDialog
 			if (NeedScrollbar)
 			{
 				GuiElementScrollbar scrollbar = SingleComposer.GetScrollbar("configscroll");
-
 				scrollbar.SetHeights((float)visibleHeight, ContentHeight);
-
 				SetScroll(ScrollValue);
 			}
 		}
@@ -523,25 +661,28 @@ public sealed class GuiDialogModManager : GuiDialog
 		UpdateApplyButton();
 	}
 
-	private List<BlockLayout> BuildLayouts(ImmConfigBlockPacket[] blocks, double contentWidth)
+	private List<BlockLayout> BuildLayouts(ImmConfigBlockPacket[] blocks, double contentWidth, string searchQuery)
 	{
 		List<BlockLayout> layouts = new();
 
 		double y = 4;
 		double cardWidth = Math.Max(120, contentWidth - CardX * 2);
 		double cardTextWidth = Math.Max(80, cardWidth - CardPadding * 2);
+		bool searching = searchQuery.Length > 0;
 
 		foreach (ImmConfigBlockPacket block in blocks)
 		{
-			double blockDescriptionHeight = MeasureTextHeight(NormalizeDescription(block.Description), CairoFont.WhiteDetailText(), contentWidth);
+			ImmConfigControlPacket[] blockControls = block.Controls ?? Array.Empty<ImmConfigControlPacket>();
+			if (searching) { blockControls = blockControls.Where(control => control.Label.Contains(searchQuery, StringComparison.OrdinalIgnoreCase)).ToArray(); }
+			if (searching && blockControls.Length == 0) { continue; }
 
+			double blockDescriptionHeight = ImmRichText.Measure(capi, NormalizeDescription(block.Description), CairoFont.WhiteDetailText(), contentWidth);
 			double headerHeight = BlockTitleHeight + (blockDescriptionHeight > 0 ? BlockDescriptionGap + blockDescriptionHeight : 0);
-
 			double cardY = y + headerHeight + BlockContentGap;
 
 			List<ControlLayout> controls = new();
 
-			foreach (ImmConfigControlPacket control in block.Controls ?? Array.Empty<ImmConfigControlPacket>())
+			foreach (ImmConfigControlPacket control in blockControls)
 			{
 				bool inlineBoolean = control.Available && control.Type == "Boolean";
 
@@ -550,7 +691,7 @@ public sealed class GuiDialogModManager : GuiDialog
 				if (inlineBoolean) { bodyHeight = BooleanRowHeight; }
 				else { bodyHeight = control.Available ? ControlHeight : Math.Max(ControlHeight, MeasureTextHeight(control.UnavailableReason, CairoFont.WhiteDetailText(), cardTextWidth)); }
 
-				double descriptionHeight = MeasureTextHeight(GetControlDescription(control), CairoFont.WhiteDetailText(), cardTextWidth);
+				double descriptionHeight = ImmRichText.Measure(capi, GetControlDescription(control), CairoFont.WhiteDetailText(), cardTextWidth);
 
 				double cardHeight = inlineBoolean ? CardPadding + BooleanRowHeight + (descriptionHeight > 0 ? DescriptionGap + descriptionHeight + DescriptionBottomPadding : 0) + CardPadding : CardPadding + SettingLabelHeight + LabelControlGap + bodyHeight + (descriptionHeight > 0 ? DescriptionGap + descriptionHeight + DescriptionBottomPadding : 0) + CardPadding;
 
@@ -580,7 +721,7 @@ public sealed class GuiDialogModManager : GuiDialog
 
 		foreach (ImmDependencyPacket dependency in dependencies)
 		{
-			bool pendingRestart = PendingRestartDependencyIds.Contains(dependency.RuntimeId);
+			bool pendingRestart = PendingRestartDependencies.ContainsKey(dependency.RuntimeId);
 			bool hasInspect = !pendingRestart && (!string.IsNullOrWhiteSpace(dependency.Description) || dependency.HasResolution);
 
 			double labelWidth = Math.Max(60, cardWidth - CardPadding * 2 - (hasInspect ? DependencyInspectWidth + DependencyLabelGap : 0));
@@ -608,7 +749,7 @@ public sealed class GuiDialogModManager : GuiDialog
 		foreach (DependencyLayout layout in layouts)
 		{
 			ImmDependencyPacket dependency = layout.Dependency;
-			bool pendingRestart = PendingRestartDependencyIds.Contains(dependency.RuntimeId);
+			bool pendingRestart = PendingRestartDependencies.ContainsKey(dependency.RuntimeId);
 
 			double cardWidth = Math.Max(120, innerWidth - CardX * 2);
 
@@ -631,6 +772,7 @@ public sealed class GuiDialogModManager : GuiDialog
 				GuiElementStaticText restartElement = new(capi, restartText, EnumTextOrientation.Center, restartBounds, restartFont);
 
 				restartElement.AutoFontSize();
+				restartFont.UnscaledFontsize *= 0.96;
 				container.Add(restartElement);
 				continue;
 			}
@@ -657,13 +799,18 @@ public sealed class GuiDialogModManager : GuiDialog
 	{
 		double innerWidth = Math.Max(120, contentWidth - 8);
 
-		if (layouts.Count == 0) { AddText(container, ImmLocalization.Get("configuration-none"), CairoFont.WhiteSmallText(), ElementBounds.Fixed(4, 4, innerWidth, 24)); return; }
+		if (layouts.Count == 0)
+		{
+			string message = SearchText.Trim().Length > 0 ? ImmLocalization.Get("configuration-search-none") : ImmLocalization.Get("configuration-none");
+			AddText(container, message, CairoFont.WhiteSmallText(), ElementBounds.Fixed(4, 4, innerWidth, 24));
+			return;
+		}
 
 		foreach (BlockLayout layout in layouts)
 		{
 			AddText(container, layout.Block.ConfigLabel, CairoFont.WhiteSmallText().WithWeight(FontWeight.Bold), ElementBounds.Fixed(4, layout.Y, innerWidth, BlockTitleHeight));
 
-			if (layout.DescriptionHeight > 0) { AddText(container, NormalizeDescription(layout.Block.Description), CairoFont.WhiteDetailText(), ElementBounds.Fixed(4, layout.Y + BlockTitleHeight + BlockDescriptionGap, innerWidth, layout.DescriptionHeight)); }
+			if (layout.DescriptionHeight > 0) { AddRichText(container, NormalizeDescription(layout.Block.Description), CairoFont.WhiteDetailText(), ElementBounds.Fixed(4, layout.Y + BlockTitleHeight + BlockDescriptionGap, innerWidth, layout.DescriptionHeight)); }
 
 			foreach (ControlLayout controlLayout in layout.Controls) { AddControlCard(container, controlLayout, innerWidth); }
 		}
@@ -693,7 +840,7 @@ public sealed class GuiDialogModManager : GuiDialog
 
 			AddControlElement(container, control, ElementBounds.Fixed(contentX + contentWidthInside - BooleanToggleSize, labelY + (BooleanRowHeight - BooleanToggleSize) / 2, BooleanToggleSize, BooleanToggleSize));
 
-			if (layout.DescriptionHeight > 0) { AddText(container, GetControlDescription(control), CairoFont.WhiteDetailText(), ElementBounds.Fixed(contentX, labelY + BooleanRowHeight + DescriptionGap, contentWidthInside, layout.DescriptionHeight)); }
+			if (layout.DescriptionHeight > 0) { AddRichText(container, GetControlDescription(control), CairoFont.WhiteDetailText(), ElementBounds.Fixed(contentX, labelY + BooleanRowHeight + DescriptionGap, contentWidthInside, layout.DescriptionHeight)); }
 
 			return;
 		}
@@ -705,7 +852,7 @@ public sealed class GuiDialogModManager : GuiDialog
 		if (!control.Available) { AddText(container, control.UnavailableReason, CairoFont.WhiteDetailText().WithColor(GuiStyle.ErrorTextColor), ElementBounds.Fixed(contentX, bodyY, contentWidthInside, layout.BodyHeight)); }
 		else { AddControlElement(container, control, ElementBounds.Fixed(contentX, bodyY, contentWidthInside, ControlHeight)); }
 
-		if (layout.DescriptionHeight > 0) { AddText(container, GetControlDescription(control), CairoFont.WhiteDetailText(), ElementBounds.Fixed(contentX, bodyY + layout.BodyHeight + DescriptionGap, contentWidthInside, layout.DescriptionHeight)); }
+		if (layout.DescriptionHeight > 0) { AddRichText(container, GetControlDescription(control), CairoFont.WhiteDetailText(), ElementBounds.Fixed(contentX, bodyY + layout.BodyHeight + DescriptionGap, contentWidthInside, layout.DescriptionHeight)); }
 	}
 
 	private void AddControlElement(GuiElementContainer container, ImmConfigControlPacket control, ElementBounds bounds)
@@ -763,6 +910,7 @@ public sealed class GuiDialogModManager : GuiDialog
 	}
 
 	private void AddText(GuiElementContainer container, string text, CairoFont font, ElementBounds bounds) { container.Add(new GuiElementStaticText(capi, text, font.Orientation, bounds, font)); }
+	private void AddRichText(GuiElementContainer container, string text, CairoFont font, ElementBounds bounds) { container.Add(ImmRichText.Create(capi, text, font, bounds)); }
 
 	private void InitializeControlValues()
 	{
@@ -784,10 +932,8 @@ public sealed class GuiDialogModManager : GuiDialog
 
 					case GuiElementNumberInput number:
 						number.IntMode = control.Type == "Integer";
-
 						number.Interval = control.Type == "Integer" ? 1 : 0.1f;
-
-						number.SetValue(control.Type == "Integer" ? value.Value<int>().ToString(CultureInfo.InvariantCulture) : value.Value<double>().ToString("G", GlobalConstants.DefaultCultureInfo));
+						number.SetValue(InvalidInputValues.TryGetValue(control.Index, out string? invalidValue) ? invalidValue : control.Type == "Integer" ? value.Value<int>().ToString(CultureInfo.InvariantCulture) : value.Value<double>().ToString("G", GlobalConstants.DefaultCultureInfo));
 					break;
 
 					case GuiElementTextInput input:
@@ -806,19 +952,13 @@ public sealed class GuiDialogModManager : GuiDialog
 	private static void InitializeSlider(GuiElementSlider slider, ImmConfigControlPacket control, JToken value)
 	{
 		bool integerTarget = value.Type == JTokenType.Integer;
-
 		double step = control.HasStep ? control.Step : 1;
-
 		int tickCount = (int)Math.Round((control.Max - control.Min) / step);
-
 		int currentTick = (int)Math.Round((value.Value<double>() - control.Min) / step);
 
 		slider.ShowTextWhenResting = false;
-
 		slider.OnSliderTooltip = tick => FormatSliderValue(control.Min + tick * step, integerTarget);
-
 		slider.OnSliderRestingText = null;
-
 		slider.SetValues(currentTick, 0, tickCount, 1);
 	}
 
@@ -837,12 +977,14 @@ public sealed class GuiDialogModManager : GuiDialog
 			if (int.TryParse(value, NumberStyles.Integer, GlobalConstants.DefaultCultureInfo, out int integerValue))
 			{
 				InvalidInputs.Remove(control.Index);
+				InvalidInputValues.Remove(control.Index);
 
 				SetPendingValue(control, integerValue.ToString(CultureInfo.InvariantCulture));
 			}
 			else
 			{
 				InvalidInputs.Add(control.Index);
+				InvalidInputValues[control.Index] = value;
 				UpdateApplyButton();
 			}
 
@@ -852,12 +994,14 @@ public sealed class GuiDialogModManager : GuiDialog
 		if (double.TryParse(value, NumberStyles.Float, GlobalConstants.DefaultCultureInfo, out double decimalValue) && double.IsFinite(decimalValue))
 		{
 			InvalidInputs.Remove(control.Index);
+			InvalidInputValues.Remove(control.Index);
 
 			SetPendingValue(control, JsonConvert.SerializeObject(decimalValue));
 		}
 		else
 		{
 			InvalidInputs.Add(control.Index);
+			InvalidInputValues[control.Index] = value;
 			UpdateApplyButton();
 		}
 	}
@@ -865,17 +1009,13 @@ public sealed class GuiDialogModManager : GuiDialog
 	private bool SetPendingSlider(ImmConfigControlPacket control, int tick)
 	{
 		if (SettingControlValues) { return true; }
-
 		JToken current = JToken.Parse(control.ValueJson);
 
 		bool integerTarget = current.Type == JTokenType.Integer;
-
 		double step = control.HasStep ? control.Step : 1;
-
 		double value = control.Min + tick * step;
 
 		SetPendingValue(control, integerTarget ? Math.Round(value).ToString(CultureInfo.InvariantCulture) : JsonConvert.SerializeObject(value));
-
 		return true;
 	}
 
@@ -901,7 +1041,6 @@ public sealed class GuiDialogModManager : GuiDialog
 	private int GetDropdownSelectedIndex(ImmConfigControlPacket control)
 	{
 		if (string.IsNullOrWhiteSpace(control.ValueJson) || control.Options.Length == 0) { return 0; }
-
 		JToken current = JToken.Parse(control.ValueJson);
 
 		for (int index = 0; index < control.Options.Length; index++)
@@ -917,9 +1056,7 @@ public sealed class GuiDialogModManager : GuiDialog
 		if (ActiveTab != 0 || Applying || PendingChanges.Count == 0 || InvalidInputs.Count > 0 || string.IsNullOrWhiteSpace(SelectedModId) || Page?.Success != true || Page.ConfigurationExternallyManaged) { return true; }
 
 		Dictionary<int, ImmConfigControlPacket> controls = GetControls().ToDictionary(control => control.Index);
-
 		ImmConfigChangePacket[] clientChanges = PendingChanges.Where(change => controls[change.Key].ConfigSide == ImmConfigSide.Client).Select(ToChangePacket).ToArray();
-
 		ImmConfigChangePacket[] serverChanges = PendingChanges.Where(change => controls[change.Key].ConfigSide == ImmConfigSide.Server).Select(ToChangePacket).ToArray();
 
 		if (Page.CanManageServer == false && serverChanges.Length > 0)
@@ -969,7 +1106,6 @@ public sealed class GuiDialogModManager : GuiDialog
 		ConfigClient.ApplyServer(SelectedModId, serverChanges);
 
 		UpdateApplyButton();
-
 		return true;
 	}
 
@@ -1051,9 +1187,7 @@ public sealed class GuiDialogModManager : GuiDialog
 	}
 
 	private ImmConfigBlockPacket[] GetBlocks() { return Page?.Success == true ? (Page.Configuration ?? Array.Empty<ImmConfigBlockPacket>()).Where(block => block != null).ToArray() : Array.Empty<ImmConfigBlockPacket>(); }
-
 	private ImmDependencyPacket[] GetDependencies() { ImmConfigPageResponse? page = Page; return page?.Success == true && page.CanManageServer ? (page.Dependencies ?? Array.Empty<ImmDependencyPacket>()).Where(dependency => dependency != null).ToArray() : Array.Empty<ImmDependencyPacket>(); }
-
 	private IEnumerable<ImmConfigControlPacket> GetControls() { return GetBlocks().SelectMany(block => (block.Controls ?? Array.Empty<ImmConfigControlPacket>()).Where(control => control != null)); }
 
 	private string GetSelectedModName() { string title = !string.IsNullOrWhiteSpace(SelectedModName) ? SelectedModName : string.IsNullOrWhiteSpace(SelectedModId) ? ImmLocalization.Get("mod-configuration-title") : SelectedModId; return title.Replace('\r', ' ').Replace('\n', ' '); }
@@ -1083,7 +1217,7 @@ public sealed class GuiDialogModManager : GuiDialog
 	{
 		if (string.IsNullOrWhiteSpace(description)) { return ""; }
 
-		return BreakTagRegex.Replace(description, "\n").Replace("\r\n", "\n").Replace('\r', '\n');
+		return description.Replace("\r\n", "\n").Replace('\r', '\n');
 	}
 
 	private static double MeasureTextHeight(string? text, CairoFont font, double width)
@@ -1093,6 +1227,38 @@ public sealed class GuiDialogModManager : GuiDialog
 		TextDrawUtil textUtil = new();
 
 		return Math.Ceiling(textUtil.GetMultilineTextHeight(font, text, Math.Max(1, width)));
+	}
+
+	private void OnSearchTextChanged(string text)
+	{
+		SearchText = text ?? "";
+
+		if (SettingSearchValue) { return; }
+
+		CancelPendingSearch();
+		SearchCallbackId = capi.Event.RegisterCallback(OnSearchDebounceElapsed, SearchDebounceMs);
+	}
+
+	private void OnSearchDebounceElapsed(float deltaTime)
+	{
+		SearchCallbackId = -1;
+		if (IsOpened()) { ApplySearch(); }
+	}
+
+	private void CancelPendingSearch()
+	{
+		if (SearchCallbackId < 0) { return; }
+
+		capi.Event.UnregisterCallback(SearchCallbackId);
+		SearchCallbackId = -1;
+	}
+
+	private void ApplySearch()
+	{
+		if (!IsOpened()) { return; }
+
+		ScrollValue = 0;
+		Compose();
 	}
 
 	private void OnManagerTabClicked(int tabIndex)
@@ -1175,6 +1341,7 @@ public sealed class GuiDialogModManager : GuiDialog
 
 	public override void OnGuiClosed()
 	{
+		CancelPendingSearch();
 		DependencyIssueDialog.TryClose();
 		ArrayEditorDialog.TryClose();
 		base.OnGuiClosed();
@@ -1182,6 +1349,7 @@ public sealed class GuiDialogModManager : GuiDialog
 
 	public override void Dispose()
 	{
+		CancelPendingSearch();
 		ConfigClient.PageReceived -= OnPageReceived;
 		ConfigClient.ApplyReceived -= OnApplyReceived;
 		ConfigClient.DependencyResolveReceived -= OnDependencyResolveReceived;
@@ -1196,9 +1364,8 @@ public sealed class GuiDialogModManager : GuiDialog
 		base.Dispose();
 	}
 
+	private sealed record PendingRestartDependency(string ModId, ImmDependencyPacket? Snapshot);
 	private sealed record BlockLayout(ImmConfigBlockPacket Block, double Y, double HeaderHeight, double DescriptionHeight, List<ControlLayout> Controls, double Bottom);
-
 	private sealed record DependencyLayout(ImmDependencyPacket Dependency, double Y, double Height, double LabelHeight, bool HasInspect, double Bottom);
-
 	private sealed record ControlLayout(ImmConfigControlPacket Control, double Y, double Height, double BodyHeight, double DescriptionHeight, bool InlineBoolean);
 }

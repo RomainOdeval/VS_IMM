@@ -25,7 +25,7 @@ public sealed class ImmExternalManagerOwnership
 		Claims.Clear();
 		ActiveManagers.Clear();
 
-		IImmExternalManagerDetector[] detectors = { new ImmConfigLibOwnershipDetector() };
+		IImmExternalManagerDetector[] detectors = { new ImmConfigLibOwnershipDetector(), new ImmConfigKitOwnershipDetector() };
 
 		foreach (IImmExternalManagerDetector detector in detectors)
 		{
@@ -40,6 +40,14 @@ public sealed class ImmExternalManagerOwnership
 	{
 		if (string.IsNullOrWhiteSpace(modId) || !Claims.TryGetValue(modId, out List<ImmExternalManagerClaim>? claims)) { return Array.Empty<ImmExternalManagerClaim>(); }
 		return claims;
+	}
+
+	public string GetPrimaryManagerName(ICoreAPI api, string modId)
+	{
+		if (string.IsNullOrWhiteSpace(modId) || !Claims.TryGetValue(modId, out List<ImmExternalManagerClaim>? claims) || claims.Count == 0) { return ""; }
+
+		ImmExternalManagerClaim claim = claims[0];
+		return api.ModLoader.GetMod(claim.ManagerId)?.Info?.Name ?? claim.ManagerName;
 	}
 
 	internal void RegisterManager(string managerId)

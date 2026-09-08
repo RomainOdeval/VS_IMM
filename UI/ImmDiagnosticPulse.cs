@@ -65,6 +65,13 @@ public static class ImmDiagnosticPulse
 		return SetColor(color, 164 * brightness, 126 * brightness, 38 * brightness, 225);
 	}
 
+
+	public static Vec4f SetUpdateOverlayColor(bool retracted, double phase, Vec4f color)
+	{
+		double alpha = 42 + phase * 48;
+		return retracted ? SetColor(color, 205, 61, 52, alpha) : SetColor(color, 66, 188, 82, alpha);
+	}
+
 	public static Vec4f SetTabOverlayColor(ImmDiagnosticLevel level, double phase, Vec4f color)
 	{
 		double alpha = 48 + phase * 42;

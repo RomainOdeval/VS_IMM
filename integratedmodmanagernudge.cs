@@ -174,8 +174,8 @@ public sealed class IntegratedModManagerNudge : IRenderer
 
 		if (DiagnosticLevel != ImmDiagnosticLevel.None && ImmDiagnosticPulse.IsHighlightEnabled(HighlightMode))
 		{
-			titleFont.WithStroke(ColorUtil.BlackArgbDouble, 0.75);
-			bodyFont.WithStroke(ColorUtil.BlackArgbDouble, 0.75);
+			titleFont.WithStroke(ColorUtil.BlackArgbDouble, 1.25);
+			bodyFont.WithStroke(ColorUtil.BlackArgbDouble, 1.25);
 		}
 
 		TitleTexture = ClientApi.Gui.TextTexture.GenTextTexture(ImmLocalization.Get("title"), titleFont);

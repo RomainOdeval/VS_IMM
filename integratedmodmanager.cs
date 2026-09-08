@@ -16,9 +16,12 @@ public sealed class IntegratedModManagerSystem : ModSystem
 	private IntegratedModManagerNudge? Nudge;
 	private ImmConfigRegistry? ConfigRegistry;
 	private ImmDependencyService? DependencyService;
+	private ImmModUpdateService? ModUpdateService;
 	private ImmConfigClient? ConfigClient;
+	private ImmModUpdateClient? ModUpdateClient;
 	private GuiDialogModSelector? ModSelector;
 	private GuiDialogModManager? ModManager;
+	private GuiDialogModUpdates? ModUpdates;
 	private GuiDialogNotification? Notification;
 	private bool ClientSideStarted;
 
@@ -28,6 +31,7 @@ public sealed class IntegratedModManagerSystem : ModSystem
 	{
 		IntegratedModManagerNudge.RegisterNetwork(api);
 		ImmConfigNetwork.RegisterNetwork(api);
+		ImmModUpdateNetwork.RegisterNetwork(api);
 	}
 
 	public override void AssetsLoaded(ICoreAPI api)
@@ -46,10 +50,12 @@ public sealed class IntegratedModManagerSystem : ModSystem
 		Nudge.StartClient();
 
 		ConfigClient = new ImmConfigClient(api);
+		ModUpdateClient = new ImmModUpdateClient(api);
 		Notification = new GuiDialogNotification(api);
 
 		ModManager = new GuiDialogModManager(api, ConfigClient, Notification);
-		ModSelector = new GuiDialogModSelector(api, ConfigClient, OpenSelectedMod);
+		ModUpdates = new GuiDialogModUpdates(api, ModUpdateClient);
+		ModSelector = new GuiDialogModSelector(api, ConfigClient, ModUpdateClient, OpenSelectedMod, OpenUpdates);
 
 		api.ChatCommands.Create("imm").WithDescription(ImmLocalization.Get("command-description")).HandleWith(_ => { Nudge.Dismiss(); OpenManager(); return TextCommandResult.Success(); });
 	}
@@ -64,11 +70,18 @@ public sealed class IntegratedModManagerSystem : ModSystem
 		DependencyService.EvaluateAll();
 
 		IntegratedModManagerNudge.StartServer(api, DependencyService);
+
+		ModUpdateService = new ImmModUpdateService(api);
+		ModUpdateService.Start();
+		ImmModUpdateNetwork.StartServer(api, ModUpdateService);
+
 		ImmConfigService configService = new(api, ConfigRegistry, DependencyService, coordinator.PatchSettings, coordinator.ContentPatches, coordinator.ExternalManagers);
 		ImmConfigNetwork.StartServer(api, configService);
 	}
 
 	public void OpenManager() { ModSelector?.TryOpen(); }
+
+	private void OpenUpdates() { ModUpdates?.TryOpen(); }
 
 	private void OpenSelectedMod(ModSelectorEntry entry)
 	{
@@ -87,14 +100,24 @@ public sealed class IntegratedModManagerSystem : ModSystem
 		Notification?.Dispose();
 		Notification = null;
 
+		ModUpdates?.Dispose();
+		ModUpdates = null;
+
 		ModManager?.Dispose();
 		ModManager = null;
 
 		ModSelector?.Dispose();
 		ModSelector = null;
 
+		ModUpdateClient?.Dispose();
+		ModUpdateClient = null;
+
 		ConfigClient?.Dispose();
 		ConfigClient = null;
+
+		ModUpdateService?.Dispose();
+		ModUpdateService = null;
+
 		DependencyService = null;
 		ConfigRegistry = null;
 

@@ -28,6 +28,7 @@ public sealed class ImmPatchExpression
 	public IReadOnlyCollection<string> BareReferences => BareReferenceSet;
 
 	public bool UsesOwningSetting { get; }
+	public bool UsesCurrentValue { get; }
 
 	private readonly HashSet<string> SettingReferenceSet;
 	private readonly HashSet<string> ConstantReferenceSet;
@@ -40,6 +41,7 @@ public sealed class ImmPatchExpression
 		ConstantReferenceSet = constantReferences;
 		BareReferenceSet = bareReferences;
 		UsesOwningSetting = root.UsesOwningSetting;
+		UsesCurrentValue = root.UsesCurrentValue;
 	}
 
 	public static ImmPatchExpression Compile(string expression)
@@ -56,10 +58,12 @@ public sealed class ImmPatchExpression
 	}
 
 	public JToken Evaluate(ImmPatchExpressionContext context) { return Root.Evaluate(context); }
+	public bool EvaluateBoolean(ImmPatchExpressionContext context) { return AsBoolean(Root.Evaluate(context)); }
 
 	private abstract class ExpressionNode
 	{
 		public virtual bool UsesOwningSetting => false;
+		public virtual bool UsesCurrentValue => false;
 
 		public abstract JToken Evaluate(ImmPatchExpressionContext context);
 	}
@@ -93,6 +97,7 @@ public sealed class ImmPatchExpression
 		}
 
 		public override bool UsesOwningSetting => Kind == ReferenceKind.Setting;
+		public override bool UsesCurrentValue => Kind == ReferenceKind.Current;
 
 		public override JToken Evaluate(ImmPatchExpressionContext context)
 		{
@@ -148,6 +153,7 @@ public sealed class ImmPatchExpression
 		}
 
 		public override bool UsesOwningSetting => Operand.UsesOwningSetting;
+		public override bool UsesCurrentValue => Operand.UsesCurrentValue;
 
 		public override JToken Evaluate(ImmPatchExpressionContext context) { JToken value = Operand.Evaluate(context); return Operator switch { TokenKind.Bang => new JValue(!AsBoolean(value)), TokenKind.Plus => NumberResult(RequireNumber(value)), TokenKind.Minus => NumberResult(-RequireNumber(value)), _ => throw new InvalidOperationException("Unsupported unary expression operator.") }; }
 	}
@@ -166,6 +172,7 @@ public sealed class ImmPatchExpression
 		}
 
 		public override bool UsesOwningSetting => Left.UsesOwningSetting || Right.UsesOwningSetting;
+		public override bool UsesCurrentValue => Left.UsesCurrentValue || Right.UsesCurrentValue;
 
 		public override JToken Evaluate(ImmPatchExpressionContext context)
 		{
@@ -222,6 +229,7 @@ public sealed class ImmPatchExpression
 		}
 
 		public override bool UsesOwningSetting => Condition.UsesOwningSetting || WhenTrue.UsesOwningSetting || WhenFalse.UsesOwningSetting;
+		public override bool UsesCurrentValue => Condition.UsesCurrentValue || WhenTrue.UsesCurrentValue || WhenFalse.UsesCurrentValue;
 
 		public override JToken Evaluate(ImmPatchExpressionContext context) { return AsBoolean(Condition.Evaluate(context)) ? WhenTrue.Evaluate(context) : WhenFalse.Evaluate(context); }
 	}
@@ -238,6 +246,7 @@ public sealed class ImmPatchExpression
 		}
 
 		public override bool UsesOwningSetting => Arguments.Any(argument => argument.UsesOwningSetting);
+		public override bool UsesCurrentValue => Arguments.Any(argument => argument.UsesCurrentValue);
 
 		public override JToken Evaluate(ImmPatchExpressionContext context)
 		{
@@ -245,8 +254,7 @@ public sealed class ImmPatchExpression
 
 			switch (name)
 			{
-				case "if":
-					RequireArity(3);
+				case "if": RequireArity(3);
 
 				return AsBoolean(Arguments[0].Evaluate(context)) ? Arguments[1].Evaluate(context) : Arguments[2].Evaluate(context);
 
@@ -264,7 +272,6 @@ public sealed class ImmPatchExpression
 					{
 						if (!AsBoolean(argument.Evaluate(context))) { return new JValue(false); }
 					}
-
 				return new JValue(true);
 
 				case "or":
@@ -277,7 +284,6 @@ public sealed class ImmPatchExpression
 					{
 						if (AsBoolean(argument.Evaluate(context))) { return new JValue(true); }
 					}
-
 				return new JValue(false);
 
 				case "greater":
@@ -336,7 +342,7 @@ public sealed class ImmPatchExpression
 
 					if (values.Length == 2) { return NumberResult(Math.Log(Number(0), Number(1))); }
 
-					throw new InvalidOperationException("log() requires one or two arguments.");
+				throw new InvalidOperationException("log() requires one or two arguments.");
 
 				case "round":
 					if (values.Length == 1) { return NumberResult(Math.Round(Number(0))); }
@@ -354,7 +360,7 @@ public sealed class ImmPatchExpression
 						return NumberResult(Math.Round(Number(0), digits));
 					}
 
-					throw new InvalidOperationException("round() requires one or two arguments.");
+				throw new InvalidOperationException("round() requires one or two arguments.");
 
 				case "sign":
 					RequireArity(values, 1);
@@ -380,8 +386,7 @@ public sealed class ImmPatchExpression
 
 				return NumberResult(values.Min(RequireNumber));
 
-				default:
-					throw new InvalidOperationException($"Unknown patch expression function '{Name}'.");
+				default: throw new InvalidOperationException($"Unknown patch expression function '{Name}'.");
 			}
 		}
 

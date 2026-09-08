@@ -107,6 +107,16 @@ public sealed class ImmContentPatchService
 		{
 			if ((binding.Stage != stage && binding.Stage != ImmPatchTiming.Auto) || !ShouldRunOnThisSide(binding)) { continue; }
 
+			try
+			{
+				if (!EvaluateCondition(binding)) { continue; }
+			}
+			catch (Exception exception)
+			{
+				if (!binding.Target.Optional) { Api.Logger.Warning("[integratedmodmanager] Content patch {0} in {1}:config/imm.json condition failed: {2}", binding.Description, binding.SourceModId, exception.Message); }
+				continue;
+			}
+
 			ResolveAssets(binding, stage, patternMatches, resolved);
 		}
 
@@ -244,11 +254,14 @@ public sealed class ImmContentPatchService
 		}
 	}
 
-	private void PublishBootstrapSnapshot()
+	private void PublishBootstrapSnapshot() // Legacy support & repair stuff should be removed by version 1.1.0
 	{
 		ITreeAttribute? worldConfig = Api.World?.Config;
 
 		if (worldConfig == null) { Api.Logger.Warning("[integratedmodmanager] World.Config was unavailable while publishing active PatchSettings."); return; }
+
+		string previousValue = worldConfig.GetAsString(BootstrapWorldConfigKey, "");
+		bool migratingLegacy = !string.IsNullOrWhiteSpace(previousValue) && !previousValue.StartsWith(BootstrapEncodingPrefix, StringComparison.Ordinal);
 		JObject snapshot = new();
 
 		foreach (KeyValuePair<string, Dictionary<string, JToken>> mod in ActiveValues)
@@ -256,17 +269,20 @@ public sealed class ImmContentPatchService
 			if (mod.Value.Count == 0) { continue; }
 
 			JObject values = new();
-
 			foreach (KeyValuePair<string, JToken> setting in mod.Value) { values[setting.Key] = setting.Value.DeepClone(); }
 
 			if (values.Count > 0) { snapshot[mod.Key] = values; }
 		}
 
-		if (snapshot.Count == 0) { worldConfig.RemoveAttribute(BootstrapWorldConfigKey); return; }
+		if (snapshot.Count == 0) { worldConfig.RemoveAttribute(BootstrapWorldConfigKey); }
+		else
+		{
+			string json = snapshot.ToString(Formatting.None);
+			string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+			worldConfig.SetString(BootstrapWorldConfigKey, BootstrapEncodingPrefix + encoded);
+		}
 
-		string json = snapshot.ToString(Formatting.None);
-		string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
-		worldConfig.SetString(BootstrapWorldConfigKey, BootstrapEncodingPrefix + encoded);
+		if (migratingLegacy) { Api.Logger.Notification("[integratedmodmanager] Fixed encoding issues in the file!"); }
 	}
 
 	private JObject ReadBootstrapSnapshot()
@@ -283,7 +299,7 @@ public sealed class ImmContentPatchService
 				return JObject.Parse(json);
 			}
 
-			// Legacy recovery for worlds written by the original mod release which caused crashes. I should remove this in a few versions. (todo)
+			// Keep legacy raw JSON readable so old worlds and backups can load once and be rewritten server-side using the safe encoding.
 			return JObject.Parse(value);
 		}
 		catch (Exception exception) { Api.Logger.Warning("[integratedmodmanager] Active PatchSettings bootstrap snapshot could not be parsed: {0}", exception.Message); return new JObject(); }
@@ -322,11 +338,12 @@ public sealed class ImmContentPatchService
 	{
 		ImmPatchTiming stage = ResolveTiming(target);
 		ImmPatchExpression? expression = string.IsNullOrWhiteSpace(target.Expression) ? null : ImmPatchExpression.Compile(target.Expression);
+		ImmPatchExpression? condition = string.IsNullOrWhiteSpace(target.Condition) ? null : ImmPatchExpression.Compile(target.Condition);
 
-		RegisterSettingDependencies(sourceModId, target, expression, owningSettingCode, owningSettingSide);
+		RegisterSettingDependencies(sourceModId, target, expression, condition, owningSettingCode, owningSettingSide);
 		IEnumerable<string> paths = !string.IsNullOrWhiteSpace(target.Path) ? new[] { target.Path } : target.Paths;
 
-		foreach (string path in paths) { Bindings.Add(new CompiledBinding(sourceModId, target, ImmContentPath.Compile(path), path, expression, target.Value?.DeepClone(), owningSettingCode, owningSettingSide, constants, stage, sequence++, description)); }
+		foreach (string path in paths) { Bindings.Add(new CompiledBinding(sourceModId, target, ImmContentPath.Compile(path), path, expression, condition, target.Value?.DeepClone(), owningSettingCode, owningSettingSide, constants, stage, sequence++, description)); }
 	}
 
 	private void ResolveAssets(CompiledBinding binding, ImmPatchTiming stage, Dictionary<string, AssetLocation[]> patternMatches, List<ResolvedBinding> result)
@@ -413,6 +430,17 @@ public sealed class ImmContentPatchService
 		foreach ((JToken target, JToken value) in replacements) { target.Replace(value); }
 
 		return replacements.Count;
+	}
+
+	private bool EvaluateCondition(CompiledBinding binding)
+	{
+		if (binding.Condition == null) { return true; }
+
+		Dictionary<string, JToken> settings = ActiveValues.TryGetValue(binding.SourceModId, out Dictionary<string, JToken>? values) ? values : new Dictionary<string, JToken>(StringComparer.Ordinal);
+		JToken? owningSetting = null;
+
+		if (binding.OwningSettingCode != null && settings.TryGetValue(binding.OwningSettingCode, out JToken? value)) { owningSetting = value; }
+		return binding.Condition.EvaluateBoolean(new ImmPatchExpressionContext { Setting = owningSetting?.DeepClone(), Settings = settings, Constants = binding.Constants });
 	}
 
 	private JToken EvaluateRequestedValue(CompiledBinding binding, JToken current)
@@ -515,23 +543,27 @@ public sealed class ImmContentPatchService
 	{
 		bool sideAllowed = binding.Target.Side switch { ImmPatchSide.Server => Api.Side == EnumAppSide.Server, ImmPatchSide.Client => Api.Side == EnumAppSide.Client, ImmPatchSide.Both => true, _ => binding.OwningSettingSide != ImmConfigSide.Client || Api.Side == EnumAppSide.Client };
 
-		if (!sideAllowed) { return false; }
+		return sideAllowed && ReferencesAvailable(binding, binding.Expression) && ReferencesAvailable(binding, binding.Condition);
+	}
 
-		if (binding.Expression == null) { return true; }
+	private bool ReferencesAvailable(CompiledBinding binding, ImmPatchExpression? expression)
+	{
+		if (expression == null) { return true; }
 
 		ActiveValues.TryGetValue(binding.SourceModId, out Dictionary<string, JToken>? active);
 
-		foreach (string code in binding.Expression.SettingReferences)
+		foreach (string code in expression.SettingReferences)
 		{
 			if (active?.ContainsKey(code) != true) { return false; }
 		}
 
-		foreach (string code in binding.Expression.BareReferences)
+		foreach (string code in expression.BareReferences)
 		{
 			if (binding.Constants.ContainsKey(code)) { continue; }
-
 			if (active?.ContainsKey(code) != true) { return false; }
 		}
+
+		if (expression.UsesOwningSetting && binding.OwningSettingCode != null && active?.ContainsKey(binding.OwningSettingCode) != true) { return false; }
 
 		return true;
 	}
@@ -544,14 +576,16 @@ public sealed class ImmContentPatchService
 		return (category.SideType & Api.Side) != (EnumAppSide)0;
 	}
 
-	private void RegisterSettingDependencies(string sourceModId, ImmContentPatchTarget target, ImmPatchExpression? expression, string? owningSettingCode, ImmConfigSide? owningSettingSide)
+	private void RegisterSettingDependencies(string sourceModId, ImmContentPatchTarget target, ImmPatchExpression? expression, ImmPatchExpression? condition, string? owningSettingCode, ImmConfigSide? owningSettingSide)
 	{
-		bool usesOwningSetting = owningSettingCode != null && owningSettingSide.HasValue && (expression?.UsesOwningSetting == true || (expression == null && target.Value == null));
+		bool usesOwningSetting = owningSettingCode != null && owningSettingSide.HasValue && (expression?.UsesOwningSetting == true || condition?.UsesOwningSetting == true || (expression == null && target.Value == null));
 
 		if (usesOwningSetting) { PatchSettingsAffectingContent.Add(new PatchSettingKey(sourceModId, owningSettingCode!, owningSettingSide!.Value)); }
-		if (expression == null) { return; }
 
-		IEnumerable<string> referencedCodes = expression.SettingReferences.Concat(expression.BareReferences);
+		IEnumerable<string> referencedCodes = (expression?.SettingReferences ?? Array.Empty<string>())
+			.Concat(expression?.BareReferences ?? Array.Empty<string>())
+			.Concat(condition?.SettingReferences ?? Array.Empty<string>())
+			.Concat(condition?.BareReferences ?? Array.Empty<string>());
 
 		foreach (string code in referencedCodes.Distinct(StringComparer.Ordinal))
 		{
@@ -649,6 +683,6 @@ public sealed class ImmContentPatchService
 	}
 
 	private readonly record struct PatchSettingKey(string ModId, string Code, ImmConfigSide Side);
-	private sealed record CompiledBinding(string SourceModId, ImmContentPatchTarget Target, ImmContentPath Path, string PathText, ImmPatchExpression? Expression, JToken? StaticValue, string? OwningSettingCode, ImmConfigSide? OwningSettingSide, Dictionary<string, JToken> Constants, ImmPatchTiming Stage, int Sequence, string Description);
+	private sealed record CompiledBinding(string SourceModId, ImmContentPatchTarget Target, ImmContentPath Path, string PathText, ImmPatchExpression? Expression, ImmPatchExpression? Condition, JToken? StaticValue, string? OwningSettingCode, ImmConfigSide? OwningSettingSide, Dictionary<string, JToken> Constants, ImmPatchTiming Stage, int Sequence, string Description);
 	private sealed record ResolvedBinding(CompiledBinding Binding, AssetLocation Location);
 }

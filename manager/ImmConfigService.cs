@@ -76,7 +76,8 @@ public sealed class ImmConfigService
 				Configuration = Array.Empty<ImmConfigBlockPacket>(),
 				Dependencies = canManageServer ? BuildDependencyPackets(request.ModId) : Array.Empty<ImmDependencyPacket>(),
 				ConfigurationExternallyManaged = true,
-				ExternalManagerActive = ExternalManagers.AnyManagerActive
+				ExternalManagerActive = ExternalManagers.AnyManagerActive,
+				ExternalManagerName = ExternalManagers.GetPrimaryManagerName(Api, request.ModId)
 			};
 		}
 

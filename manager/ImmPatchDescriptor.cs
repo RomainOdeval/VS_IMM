@@ -65,6 +65,7 @@ public sealed class ImmContentPatchTarget
 	public ImmPatchSide Side = ImmPatchSide.Auto;
 
 	public string Expression = "";
+	public string Condition = "";
 	public JToken? Value;
 
 	public bool Optional;

@@ -17,7 +17,7 @@ public static class ImmLocalization
 	public static string Resolve(string? text)
 	{
 		if (string.IsNullOrEmpty(text)) { return ""; }
-		if (text.IndexOf(':') <= 0) { return text; }
+		if (!LooksLikeLocalizationKey(text)) { return text; }
 
 		return Lang.Get(text);
 	}
@@ -25,9 +25,30 @@ public static class ImmLocalization
 	public static string ResolveForLanguage(string? text, string languageCode)
 	{
 		if (string.IsNullOrEmpty(text)) { return ""; }
-		if (text.IndexOf(':') <= 0) { return text; }
+		if (!LooksLikeLocalizationKey(text)) { return text; }
 
 		return Lang.GetL(languageCode, text);
+	}
+
+	private static bool LooksLikeLocalizationKey(string text)
+	{
+		int colon = text.IndexOf(':');
+
+		if (colon <= 0 || colon != text.LastIndexOf(':') || colon == text.Length - 1 || text.Contains("://", StringComparison.Ordinal)) { return false; }
+
+		for (int index = 0; index < colon; index++)
+		{
+			char character = text[index];
+			if (!char.IsLetterOrDigit(character) && character is not '-' and not '_' and not '.') { return false; }
+		}
+
+		for (int index = colon + 1; index < text.Length; index++)
+		{
+			char character = text[index];
+			if (char.IsWhiteSpace(character) || character is '<' or '>' or '"' or '\'' or '=') { return false; }
+		}
+
+		return true;
 	}
 
 	public static void LocalizePage(ImmConfigPageResponse page)

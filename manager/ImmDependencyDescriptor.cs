@@ -20,7 +20,9 @@ public enum ImmDependencyCriterionType
 	Unknown,
 	Setting,
 	GridRecipeCount,
-	HasModID
+	HasModID,
+	CollectibleBehavior,
+	CollectibleAttribute
 }
 
 [JsonConverter(typeof(StringEnumConverter))]
@@ -29,7 +31,16 @@ public enum ImmDependencyOperator
 	Equal,
 	NotEqual,
 	GreaterThan,
-	LessThan
+	LessThan,
+	Exists,
+	NotExists
+}
+
+[JsonConverter(typeof(StringEnumConverter))]
+public enum ImmDependencyCollectibleClass
+{
+	Item,
+	Block
 }
 
 [JsonConverter(typeof(StringEnumConverter))]
@@ -56,10 +67,14 @@ public sealed class ImmDependencyEntry
 public sealed class ImmDependencyCriterion
 {
 	public ImmDependencyCriterionType Type;
-	public ImmDependencySettingTarget? Target;
+	public ImmDependencyCriterionTarget? Target;
 	public string Output = "";
+	public string Behavior = "";
+	public string Path = "";
 	public ImmDependencyOperator Operator = ImmDependencyOperator.Equal;
 	public JToken? Value;
+
+	[JsonIgnore] public ImmContentPath? CompiledPath;
 }
 
 public sealed class ImmDependencyResolution
@@ -70,7 +85,7 @@ public sealed class ImmDependencyResolution
 	public string ModId = "";
 }
 
-public sealed class ImmDependencySettingTarget
+public class ImmDependencySettingTarget
 {
 	// ModConfig target
 	public string ConfigFile = "";
@@ -79,4 +94,10 @@ public sealed class ImmDependencySettingTarget
 	// Optional owning mod for either target type. Defaults to the descriptor owner.
 	public string ModId = "";
 	public string PatchSetting = "";
+}
+
+public sealed class ImmDependencyCriterionTarget : ImmDependencySettingTarget
+{
+	public ImmDependencyCollectibleClass? Class;
+	public string Code = "";
 }

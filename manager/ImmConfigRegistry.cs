@@ -477,43 +477,33 @@ public sealed class ImmConfigRegistry
 			throw new InvalidDataException($"{prefix} requires Expression or Value because it has no owning PatchSetting.");
 		}
 
-		if (!hasExpression) { return; }
+		if (hasExpression) { ValidatePatchExpression(target.Expression, $"{prefix}.Expression", hasOwningSetting, patchSettingCodes, constantCodes, allowCurrent: true); }
+		if (!string.IsNullOrWhiteSpace(target.Condition)) { ValidatePatchExpression(target.Condition, $"{prefix}.Condition", hasOwningSetting, patchSettingCodes, constantCodes, allowCurrent: false); }
+	}
 
+	private static void ValidatePatchExpression(string source, string prefix, bool hasOwningSetting, HashSet<string> patchSettingCodes, HashSet<string> constantCodes, bool allowCurrent)
+	{
 		ImmPatchExpression expression;
 
-		try { expression = ImmPatchExpression.Compile(target.Expression); }
-		catch (Exception exception)
-		{
-			throw new InvalidDataException($"{prefix}.Expression is invalid: {exception.Message}");
-		}
+		try { expression = ImmPatchExpression.Compile(source); }
+		catch (Exception exception) { throw new InvalidDataException($"{prefix} is invalid: {exception.Message}"); }
 
-		if (expression.UsesOwningSetting && !hasOwningSetting)
-		{
-			throw new InvalidDataException($"{prefix}.Expression uses Setting but the patch has no owning PatchSetting.");
-		}
+		if (expression.UsesOwningSetting && !hasOwningSetting) { throw new InvalidDataException($"{prefix} uses Setting but the patch has no owning PatchSetting."); }
+		if (!allowCurrent && expression.UsesCurrentValue) { throw new InvalidDataException($"{prefix} cannot reference Current/value because conditions are evaluated before asset/path resolution."); }
 
 		foreach (string code in expression.SettingReferences)
 		{
-			if (!patchSettingCodes.Contains(code))
-			{
-				throw new InvalidDataException($"{prefix}.Expression references unknown PatchSetting '{code}'.");
-			}
+			if (!patchSettingCodes.Contains(code)) { throw new InvalidDataException($"{prefix} references unknown PatchSetting '{code}'."); }
 		}
 
 		foreach (string code in expression.ConstantReferences)
 		{
-			if (!constantCodes.Contains(code))
-			{
-				throw new InvalidDataException($"{prefix}.Expression references unknown Constant '{code}'.");
-			}
+			if (!constantCodes.Contains(code)) { throw new InvalidDataException($"{prefix} references unknown Constant '{code}'."); }
 		}
 
 		foreach (string code in expression.BareReferences)
 		{
-			if (!patchSettingCodes.Contains(code) && !constantCodes.Contains(code))
-			{
-				throw new InvalidDataException($"{prefix}.Expression contains unknown identifier '{code}'.");
-			}
+			if (!patchSettingCodes.Contains(code) && !constantCodes.Contains(code)) { throw new InvalidDataException($"{prefix} contains unknown identifier '{code}'."); }
 		}
 	}
 
@@ -566,6 +556,8 @@ public sealed class ImmConfigRegistry
 		switch (criterion.Type)
 		{
 			case ImmDependencyCriterionType.Setting:
+				ValidateComparisonOperator(criterion.Operator, $"{prefix}.Operator");
+
 				if (criterion.Target == null)
 				{
 					throw new InvalidDataException($"{prefix}.Target is required for Setting.");
@@ -577,6 +569,7 @@ public sealed class ImmConfigRegistry
 			break;
 
 			case ImmDependencyCriterionType.GridRecipeCount:
+				ValidateComparisonOperator(criterion.Operator, $"{prefix}.Operator");
 				ValidateAssetCode(criterion.Output, $"{prefix}.Output");
 
 				if (criterion.Value == null || criterion.Value.Type != JTokenType.Integer || criterion.Value.Value<long>() < 0)
@@ -594,6 +587,68 @@ public sealed class ImmConfigRegistry
 				if (criterion.Operator != ImmDependencyOperator.Equal)
 				{
 					throw new InvalidDataException($"{prefix}.Operator must be Equal for HasModID.");
+				}
+			break;
+
+			case ImmDependencyCriterionType.CollectibleBehavior:
+				ValidatePresenceOperator(criterion.Operator, $"{prefix}.Operator");
+				ValidateCollectibleCriterionTarget(criterion.Target, $"{prefix}.Target");
+
+				if (string.IsNullOrWhiteSpace(criterion.Behavior))
+				{
+					throw new InvalidDataException($"{prefix}.Behavior is required for CollectibleBehavior.");
+				}
+
+				if (!string.IsNullOrWhiteSpace(criterion.Path))
+				{
+					throw new InvalidDataException($"{prefix}.Path must be omitted for CollectibleBehavior.");
+				}
+
+				if (criterion.Value != null)
+				{
+					throw new InvalidDataException($"{prefix}.Value must be omitted for CollectibleBehavior.");
+				}
+			break;
+
+			case ImmDependencyCriterionType.CollectibleAttribute:
+				ValidateCollectibleCriterionTarget(criterion.Target, $"{prefix}.Target");
+
+				if (!string.IsNullOrWhiteSpace(criterion.Behavior))
+				{
+					throw new InvalidDataException($"{prefix}.Behavior must be omitted for CollectibleAttribute.");
+				}
+
+				if (string.IsNullOrWhiteSpace(criterion.Path))
+				{
+					throw new InvalidDataException($"{prefix}.Path is required for CollectibleAttribute.");
+				}
+
+				try { criterion.CompiledPath = ImmContentPath.Compile(criterion.Path); }
+				catch (Exception exception)
+				{
+					throw new InvalidDataException($"{prefix}.Path is invalid: {exception.Message}");
+				}
+
+				if (criterion.Operator is ImmDependencyOperator.Exists or ImmDependencyOperator.NotExists)
+				{
+					if (criterion.Value != null)
+					{
+						throw new InvalidDataException($"{prefix}.Value must be omitted for {criterion.Operator}.");
+					}
+				}
+				else
+				{
+					ValidateComparisonOperator(criterion.Operator, $"{prefix}.Operator");
+
+					if (criterion.Value == null)
+					{
+						throw new InvalidDataException($"{prefix}.Value is required for {criterion.Operator}.");
+					}
+
+					if ((criterion.Operator is ImmDependencyOperator.GreaterThan or ImmDependencyOperator.LessThan) && !IsNumeric(criterion.Value))
+					{
+						throw new InvalidDataException($"{prefix}.Value must be numeric for {criterion.Operator}.");
+					}
 				}
 			break;
 		}
@@ -640,9 +695,50 @@ public sealed class ImmConfigRegistry
 		}
 	}
 
+	private static void ValidateComparisonOperator(ImmDependencyOperator comparison, string prefix)
+	{
+		if (comparison is not (ImmDependencyOperator.Equal or ImmDependencyOperator.NotEqual or ImmDependencyOperator.GreaterThan or ImmDependencyOperator.LessThan))
+		{
+			throw new InvalidDataException($"{prefix} must be Equal, NotEqual, GreaterThan, or LessThan.");
+		}
+	}
+
+	private static void ValidatePresenceOperator(ImmDependencyOperator comparison, string prefix)
+	{
+		if (comparison is not (ImmDependencyOperator.Exists or ImmDependencyOperator.NotExists))
+		{
+			throw new InvalidDataException($"{prefix} must be Exists or NotExists.");
+		}
+	}
+
+	private static void ValidateCollectibleCriterionTarget(ImmDependencyCriterionTarget? target, string prefix)
+	{
+		if (target == null)
+		{
+			throw new InvalidDataException($"{prefix} is required.");
+		}
+
+		if (!target.Class.HasValue || !Enum.IsDefined(typeof(ImmDependencyCollectibleClass), target.Class.Value))
+		{
+			throw new InvalidDataException($"{prefix}.Class must be Item or Block.");
+		}
+
+		ValidateAssetCode(target.Code, $"{prefix}.Code");
+
+		if (!string.IsNullOrWhiteSpace(target.ConfigFile) || !string.IsNullOrWhiteSpace(target.Map) || !string.IsNullOrWhiteSpace(target.ModId) || !string.IsNullOrWhiteSpace(target.PatchSetting))
+		{
+			throw new InvalidDataException($"{prefix} collectible targets cannot declare ConfigFile, Map, ModId, or PatchSetting.");
+		}
+	}
+
 	// Returns true when the target refers to an IMM PatchSetting.
 	private static bool ValidateSettingTarget(ImmDependencySettingTarget target, string prefix)
 	{
+		if (target is ImmDependencyCriterionTarget criterionTarget && (criterionTarget.Class.HasValue || !string.IsNullOrWhiteSpace(criterionTarget.Code)))
+		{
+			throw new InvalidDataException($"{prefix} setting targets cannot declare Class or Code.");
+		}
+
 		bool hasPatchSetting = !string.IsNullOrWhiteSpace(target.PatchSetting);
 
 		bool hasConfig = !string.IsNullOrWhiteSpace(target.ConfigFile) || !string.IsNullOrWhiteSpace(target.Map);

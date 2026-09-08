@@ -3,6 +3,7 @@
 using System;
 using Cairo;
 using IntegratedModManager.Config;
+using IntegratedModManager.UI;
 using Vintagestory.API.Client;
 using Vintagestory.API.Config;
 
@@ -58,11 +59,11 @@ public sealed class GuiDialogDependencyIssue : GuiDialog
 
 		double titleHeight = Math.Max(24, Measure(title, titleFont, textWidth));
 
-		double descriptionHeight = description.Length == 0 ? 0 : Math.Max(24, Measure(description, bodyFont, textWidth));
+		double descriptionHeight = description.Length == 0 ? 0 : Math.Max(24, ImmRichText.Measure(capi, description, bodyFont, textWidth));
 
 		double resolutionTextWidth = textWidth - 24;
 
-		double resolutionHeight = resolution.Length == 0 ? 0 : Math.Max(46, Measure(resolution, bodyFont, resolutionTextWidth) + 20);
+		double resolutionHeight = resolution.Length == 0 ? 0 : Math.Max(46, ImmRichText.Measure(capi, resolution, bodyFont, resolutionTextWidth) + 20);
 
 		double y = Padding;
 
@@ -131,9 +132,9 @@ public sealed class GuiDialogDependencyIssue : GuiDialog
 
 		GuiComposer composer = capi.Gui.CreateCompo("integratedmodmanager-dependency-issue", ElementStdBounds.AutosizedMainDialog.WithAlignment(EnumDialogArea.CenterMiddle)).AddShadedDialogBG(backgroundBounds, withTitleBar: false).BeginChildElements(backgroundBounds).AddStaticText(title, titleFont, EnumTextOrientation.Center, titleBounds);
 
-		if (descriptionBounds != null) { composer.AddStaticText(description, bodyFont, descriptionBounds); }
+		if (descriptionBounds != null) { composer.AddInteractiveElement(ImmRichText.Create(capi, description, bodyFont, descriptionBounds)); }
 
-		if (resolutionBounds != null && resolutionTextBounds != null) { composer.AddInset(resolutionBounds, depth: 3, brightness: 0.9f).AddStaticText(resolution, bodyFont, resolutionTextBounds); }
+		if (resolutionBounds != null && resolutionTextBounds != null) { composer.AddInset(resolutionBounds, depth: 3, brightness: 0.9f).AddInteractiveElement(ImmRichText.Create(capi, resolution, bodyFont, resolutionTextBounds)); }
 
 		if (resolveBounds != null) { composer.AddSmallButton(ImmLocalization.Get("button-auto-resolve"), OnAutoResolveClicked, resolveBounds); }
 

@@ -9,6 +9,7 @@ using IntegratedModManager.UI;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Config;
+using Vintagestory.API.MathTools;
 
 namespace IntegratedModManager.ModSelector;
 
@@ -23,7 +24,9 @@ public sealed class GuiDialogModSelector : GuiDialog
 
 	private readonly List<ModSelectorEntry> Entries = new();
 	private readonly ImmConfigClient ConfigClient;
+	private readonly ImmModUpdateClient UpdateClient;
 	private readonly Action<ModSelectorEntry> ModSelected;
+	private readonly Action UpdatesSelected;
 
 	private GuiElementModGrid? ModGrid;
 	private string SearchText = "";
@@ -32,22 +35,33 @@ public sealed class GuiDialogModSelector : GuiDialog
 	private bool SettingSearchValue;
 	private bool CanManageServer;
 	private long SearchCallbackId = -1;
+	private long UpdatePollCallbackId = -1;
 	private int SelectorRows = 2;
 	private ImmImportantInformationHighlight HighlightMode = ImmImportantInformationHighlight.Pulsating;
 	private int LastFrameWidth;
 	private int LastFrameHeight;
+	private int UpdateAvailableCount;
+	private int UpdatePendingRestartCount;
+	private int UpdateRetractedCount;
+	private ImmModUpdateCheckState UpdateCheckState = ImmModUpdateCheckState.NotChecked;
+	private ElementBounds? UpdateButtonBounds;
+	private LoadedTexture? UpdateFillTexture;
+	private readonly Vec4f UpdatePulseColor = new();
 
 	public override string ToggleKeyCombinationCode => null!;
 	public override bool DisableMouseGrab => true;
 	public override bool PrefersUngrabbedMouse => true;
 	public override bool CaptureAllInputs() => true;
 
-	public GuiDialogModSelector(ICoreClientAPI capi, ImmConfigClient configClient, Action<ModSelectorEntry> modSelected) : base(capi)
+	public GuiDialogModSelector(ICoreClientAPI capi, ImmConfigClient configClient, ImmModUpdateClient updateClient, Action<ModSelectorEntry> modSelected, Action updatesSelected) : base(capi)
 	{
 		ConfigClient = configClient;
+		UpdateClient = updateClient;
 		ModSelected = modSelected;
+		UpdatesSelected = updatesSelected;
 
 		ConfigClient.CatalogReceived += OnCatalogReceived;
+		UpdateClient.SummaryReceived += OnUpdateSummaryReceived;
 	}
 
 	public override bool TryOpen()
@@ -61,6 +75,7 @@ public sealed class GuiDialogModSelector : GuiDialog
 		SelectorRows = IntegratedModManagerConfig.SelectorRows;
 		HighlightMode = IntegratedModManagerConfig.ConfiguredInformationHighlight;
 		CancelPendingSearch();
+		CancelUpdatePolling();
 		Compose();
 
 		bool opened = base.TryOpen();
@@ -75,6 +90,7 @@ public sealed class GuiDialogModSelector : GuiDialog
 		if (capi.Render.FrameWidth > 0 && capi.Render.FrameHeight > 0 && (LastFrameWidth != capi.Render.FrameWidth || LastFrameHeight != capi.Render.FrameHeight)) { Compose(); }
 
 		base.OnRenderGUI(deltaTime);
+		RenderUpdateHighlight();
 	}
 
 	public override void OnKeyDown(KeyEvent args)
@@ -93,7 +109,9 @@ public sealed class GuiDialogModSelector : GuiDialog
 	public override void OnGuiClosed()
 	{
 		CancelPendingSearch();
+		CancelUpdatePolling();
 		ModGrid = null;
+		UpdateButtonBounds = null;
 		ClearComposers();
 		base.OnGuiClosed();
 	}
@@ -141,6 +159,8 @@ public sealed class GuiDialogModSelector : GuiDialog
 		}
 
 		Compose();
+
+		if (CanManageServer) { UpdateClient.RequestSummary(); }
 	}
 
 	private void Compose()
@@ -159,18 +179,22 @@ public sealed class GuiDialogModSelector : GuiDialog
 
 		const double filterButtonWidth = 42;
 		const double filterButtonGap = 8;
+		const double updateButtonWidth = 120;
 		const double closeButtonWidth = 90;
 
-		double searchWidth = Math.Clamp(screenWidth * 0.34, 260, 560);
-		double searchX = (screenWidth - searchWidth) / 2;
+		double closeX = screenWidth - margin - closeButtonWidth;
+		double updatesX = closeX - filterButtonGap - updateButtonWidth;
+		double leftControlsRight = CanManageServer ? margin + filterButtonWidth * 2 + filterButtonGap : margin;
+		double searchLeft = leftControlsRight + 16;
+		double searchRight = (CanManageServer ? updatesX : closeX) - 16;
+		double searchWidth = Math.Min(Math.Clamp(screenWidth * 0.34, 260, 560), Math.Max(160, searchRight - searchLeft));
+		double searchX = Math.Clamp((screenWidth - searchWidth) / 2, searchLeft, Math.Max(searchLeft, searchRight - searchWidth));
 
 		ElementBounds warningBounds = ElementBounds.Fixed(margin, top, filterButtonWidth, HeaderHeight);
-
 		ElementBounds errorBounds = ElementBounds.Fixed(margin + filterButtonWidth + filterButtonGap, top, filterButtonWidth, HeaderHeight);
-
+		ElementBounds updatesBounds = ElementBounds.Fixed(updatesX, top + 4, updateButtonWidth, HeaderHeight - 8);
 		ElementBounds searchBounds = ElementBounds.Fixed(searchX, top + 4, searchWidth, HeaderHeight - 8);
-
-		ElementBounds closeBounds = ElementBounds.Fixed(screenWidth - margin - closeButtonWidth, top + 4, closeButtonWidth, HeaderHeight - 8);
+		ElementBounds closeBounds = ElementBounds.Fixed(closeX, top + 4, closeButtonWidth, HeaderHeight - 8);
 
 		double gridY = top + HeaderHeight + HeaderGap;
 		double gridHeight = Math.Max(120, screenHeight - gridY - margin);
@@ -185,7 +209,12 @@ public sealed class GuiDialogModSelector : GuiDialog
 
 		GuiComposer composer = capi.Gui.CreateCompo("integratedmodmanager-modselector", ElementBounds.Fill).AddGameOverlay(ElementBounds.Fill, overlayColor);
 
-		if (CanManageServer) { composer.AddImmDiagnosticToggleButton(ImmLocalization.Get("selector-warning-short"), CairoFont.SmallButtonText(), OnWarningFilterChanged, warningBounds, ImmDiagnosticLevel.Warning, "warnings").AddImmDiagnosticToggleButton(ImmLocalization.Get("selector-error-short"), CairoFont.SmallButtonText(), OnErrorFilterChanged, errorBounds, ImmDiagnosticLevel.Error, "errors"); }
+		if (CanManageServer)
+		{
+			composer.AddImmDiagnosticToggleButton(ImmLocalization.Get("selector-warning-short"), CairoFont.SmallButtonText(), OnWarningFilterChanged, warningBounds, ImmDiagnosticLevel.Warning, "warnings")
+				.AddImmDiagnosticToggleButton(ImmLocalization.Get("selector-error-short"), CairoFont.SmallButtonText(), OnErrorFilterChanged, errorBounds, ImmDiagnosticLevel.Error, "errors")
+				.AddSmallButton(ImmLocalization.Get("updates-button"), OnUpdatesClicked, updatesBounds, key: "updates");
+		}
 
 		SingleComposer = composer.AddInteractiveElement(new GuiElementImmSearchInput(capi, searchBounds, OnSearchTextChanged, CairoFont.TextInput()), "search").AddSmallButton(ImmLocalization.Get("button-close"), OnCloseClicked, closeBounds).AddModSelectorGrid(Entries, OnModClicked, SelectorRows, HighlightMode, gridBounds, "modgrid").Compose();
 
@@ -194,6 +223,7 @@ public sealed class GuiDialogModSelector : GuiDialog
 			SingleComposer.GetToggleButton("warnings").SetValue(FilterWarnings);
 
 			SingleComposer.GetToggleButton("errors").SetValue(FilterErrors);
+			UpdateButtonBounds = SingleComposer.GetButton("updates").Bounds;
 		}
 
 		GuiElementTextInput searchInput = SingleComposer.GetTextInput("search");
@@ -205,6 +235,57 @@ public sealed class GuiDialogModSelector : GuiDialog
 
 		ModGrid = SingleComposer.GetModSelectorGrid("modgrid");
 		ApplyFilters();
+	}
+
+	private void OnUpdateSummaryReceived(ImmModUpdateSummaryResponse packet)
+	{
+		if (!IsOpened() || !CanManageServer || !packet.Success) { return; }
+
+		UpdateAvailableCount = packet.AvailableCount;
+		UpdatePendingRestartCount = packet.PendingRestartCount;
+		UpdateRetractedCount = packet.RetractedCount;
+		UpdateCheckState = packet.State;
+
+		if (UpdateCheckState == ImmModUpdateCheckState.Checking) { ScheduleUpdatePoll(); }
+		else { CancelUpdatePolling(); }
+	}
+
+	private void ScheduleUpdatePoll()
+	{
+		if (UpdatePollCallbackId >= 0) { return; }
+
+		UpdatePollCallbackId = capi.Event.RegisterCallback(_ =>
+		{
+			UpdatePollCallbackId = -1;
+			if (IsOpened() && CanManageServer) { UpdateClient.RequestSummary(); }
+		}, 650);
+	}
+
+	private void CancelUpdatePolling()
+	{
+		if (UpdatePollCallbackId < 0) { return; }
+		capi.Event.UnregisterCallback(UpdatePollCallbackId);
+		UpdatePollCallbackId = -1;
+	}
+
+	private void RenderUpdateHighlight()
+	{
+		if (!CanManageServer || UpdateButtonBounds == null || UpdateAvailableCount + UpdatePendingRestartCount <= 0 || !ImmDiagnosticPulse.IsHighlightEnabled(HighlightMode)) { return; }
+
+		UpdateFillTexture ??= ImmDiagnosticPulse.CreateSolidTexture(capi);
+		UpdateButtonBounds.CalcWorldBounds();
+
+		double phase = ImmDiagnosticPulse.GetHighlightPhase(HighlightMode, capi.ElapsedMilliseconds);
+		ImmDiagnosticPulse.SetUpdateOverlayColor(UpdateRetractedCount > 0, phase, UpdatePulseColor);
+
+		capi.Render.Render2DTexture(UpdateFillTexture.TextureId, (float)UpdateButtonBounds.renderX, (float)UpdateButtonBounds.renderY, (float)UpdateButtonBounds.InnerWidth, (float)UpdateButtonBounds.InnerHeight, 60, UpdatePulseColor);
+	}
+
+	private bool OnUpdatesClicked()
+	{
+		UpdatesSelected();
+		TryClose();
+		return true;
 	}
 
 	private void OnSearchTextChanged(string text)
@@ -266,9 +347,13 @@ public sealed class GuiDialogModSelector : GuiDialog
 	public override void Dispose()
 	{
 		ConfigClient.CatalogReceived -= OnCatalogReceived;
+		UpdateClient.SummaryReceived -= OnUpdateSummaryReceived;
 
 		CancelPendingSearch();
+		CancelUpdatePolling();
 		ModGrid = null;
+		UpdateFillTexture?.Dispose();
+		UpdateFillTexture = null;
 		base.Dispose();
 	}
 }

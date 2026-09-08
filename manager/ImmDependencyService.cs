@@ -54,11 +54,12 @@ public sealed class ImmDependencyService
 	{
 		Dictionary<string, JObject?> configs = new(StringComparer.OrdinalIgnoreCase);
 		Dictionary<string, int> recipeCounts = new(StringComparer.OrdinalIgnoreCase);
+		Dictionary<string, CollectibleObject?> collectibles = new(StringComparer.OrdinalIgnoreCase);
 		List<ImmActiveDependency> active = new();
 
 		foreach (ImmRegisteredDependency registered in Registry.Dependencies)
 		{
-			if (PendingRestartRuntimeIds.Contains(registered.RuntimeId) || IsActive(registered, configs, recipeCounts)) { active.Add(new ImmActiveDependency(registered.RuntimeId, registered.SourceModId, registered.EntryIndex, registered.Entry.Severity)); }
+			if (PendingRestartRuntimeIds.Contains(registered.RuntimeId) || IsActive(registered, configs, recipeCounts, collectibles)) { active.Add(new ImmActiveDependency(registered.RuntimeId, registered.SourceModId, registered.EntryIndex, registered.Entry.Severity)); }
 		}
 
 		Active = active;
@@ -75,8 +76,9 @@ public sealed class ImmDependencyService
 
 		Dictionary<string, JObject?> configs = new(StringComparer.OrdinalIgnoreCase);
 		Dictionary<string, int> recipeCounts = new(StringComparer.OrdinalIgnoreCase);
+		Dictionary<string, CollectibleObject?> collectibles = new(StringComparer.OrdinalIgnoreCase);
 
-		if (!PendingRestartRuntimeIds.Contains(runtimeId) && !IsActive(registered, configs, recipeCounts))
+		if (!PendingRestartRuntimeIds.Contains(runtimeId) && !IsActive(registered, configs, recipeCounts, collectibles))
 		{
 			EvaluateAll();
 			error = "This dependency issue is no longer active.";
@@ -130,7 +132,7 @@ public sealed class ImmDependencyService
 		return !string.IsNullOrWhiteSpace(target.PatchSetting) ? ImmDependencyResolutionWarning.ExternallyManagedPatchSetting : ImmDependencyResolutionWarning.ExternallyManagedModConfig;
 	}
 
-	private bool IsActive(ImmRegisteredDependency registered, Dictionary<string, JObject?> configs, Dictionary<string, int> recipeCounts)
+	private bool IsActive(ImmRegisteredDependency registered, Dictionary<string, JObject?> configs, Dictionary<string, int> recipeCounts, Dictionary<string, CollectibleObject?> collectibles)
 	{
 		ImmDependencyEntry entry = registered.Entry;
 
@@ -138,7 +140,7 @@ public sealed class ImmDependencyService
 
 		foreach (ImmDependencyCriterion criterion in entry.Criteria)
 		{
-			if (!TryEvaluateCriterion(registered.SourceModId, criterion, configs, recipeCounts, out bool matched, out string error)) { Api.Logger.Warning("[integratedmodmanager] Could not evaluate dependency {0}[{1}] ({2}): {3}", registered.SourceModId, registered.EntryIndex, registered.RuntimeId, error); return false; }
+			if (!TryEvaluateCriterion(registered.SourceModId, criterion, configs, recipeCounts, collectibles, out bool matched, out string error)) { Api.Logger.Warning("[integratedmodmanager] Could not evaluate dependency {0}[{1}] ({2}): {3}", registered.SourceModId, registered.EntryIndex, registered.RuntimeId, error); return false; }
 
 			if (!matched) { return false; }
 		}
@@ -146,7 +148,7 @@ public sealed class ImmDependencyService
 		return true;
 	}
 
-	private bool TryEvaluateCriterion(string sourceModId, ImmDependencyCriterion criterion, Dictionary<string, JObject?> configs, Dictionary<string, int> recipeCounts, out bool matched, out string error)
+	private bool TryEvaluateCriterion(string sourceModId, ImmDependencyCriterion criterion, Dictionary<string, JObject?> configs, Dictionary<string, int> recipeCounts, Dictionary<string, CollectibleObject?> collectibles, out bool matched, out string error)
 	{
 		switch (criterion.Type)
 		{
@@ -156,11 +158,115 @@ public sealed class ImmDependencyService
 
 			case ImmDependencyCriterionType.HasModID: return TryEvaluateHasModID(criterion, out matched, out error);
 
+			case ImmDependencyCriterionType.CollectibleBehavior: return TryEvaluateCollectibleBehavior(criterion, collectibles, out matched, out error);
+
+			case ImmDependencyCriterionType.CollectibleAttribute: return TryEvaluateCollectibleAttribute(criterion, collectibles, out matched, out error);
+
 			default:
 				matched = false;
 				error = "Unsupported criterion type.";
 			return false;
 		}
+	}
+
+	private bool TryEvaluateCollectibleBehavior(ImmDependencyCriterion criterion, Dictionary<string, CollectibleObject?> collectibles, out bool matched, out string error)
+	{
+		matched = false;
+
+		ImmDependencyCriterionTarget target = criterion.Target!;
+		if (!TryGetCollectible(target, collectibles, out CollectibleObject? collectible, out error) || collectible == null) { return false; }
+
+		ImmDependencyCollectibleClass collectibleClass = target.Class!.Value;
+		Type? behaviorType = Api.ClassRegistry.GetCollectibleBehaviorClass(criterion.Behavior);
+
+		if (collectibleClass == ImmDependencyCollectibleClass.Block)
+		{
+			Type? blockBehaviorType = Api.ClassRegistry.GetBlockBehaviorClass(criterion.Behavior);
+			if (blockBehaviorType != null) { behaviorType = blockBehaviorType; }
+		}
+
+		bool exists = behaviorType != null && collectible.GetCollectibleBehavior(behaviorType, withInheritance: true) != null;
+
+		matched = criterion.Operator == ImmDependencyOperator.Exists ? exists : !exists;
+		error = "";
+		return true;
+	}
+
+	private bool TryEvaluateCollectibleAttribute(ImmDependencyCriterion criterion, Dictionary<string, CollectibleObject?> collectibles, out bool matched, out string error)
+	{
+		matched = false;
+
+		ImmDependencyCriterionTarget target = criterion.Target!;
+		if (!TryGetCollectible(target, collectibles, out CollectibleObject? collectible, out error) || collectible == null) { return false; }
+
+		JToken? attributes = collectible.Attributes?.Token;
+		IReadOnlyList<JToken> values;
+
+		if (attributes == null) { values = Array.Empty<JToken>(); }
+		else
+		{
+			try
+			{
+				ImmContentPath path = criterion.CompiledPath ?? ImmContentPath.Compile(criterion.Path);
+				values = path.Resolve(attributes);
+			}
+			catch (Exception exception)
+			{
+				error = $"Failed to resolve collectible attribute Path '{criterion.Path}': {exception.Message}";
+				return false;
+			}
+		}
+
+		if (criterion.Operator is ImmDependencyOperator.Exists or ImmDependencyOperator.NotExists)
+		{
+			bool exists = values.Count > 0;
+			matched = criterion.Operator == ImmDependencyOperator.Exists ? exists : !exists;
+			error = "";
+			return true;
+		}
+
+		if (values.Count == 0)
+		{
+			error = "";
+			return true;
+		}
+
+		if (values.Count > 1)
+		{
+			error = $"Collectible attribute Path '{criterion.Path}' resolved {values.Count} values; comparison criteria require exactly one.";
+			return false;
+		}
+
+		return TryCompare(values[0], criterion.Value!, criterion.Operator, out matched, out error);
+	}
+
+	private bool TryGetCollectible(ImmDependencyCriterionTarget target, Dictionary<string, CollectibleObject?> collectibles, out CollectibleObject? collectible, out string error)
+	{
+		string cacheKey = $"{target.Class}:{target.Code}";
+
+		if (!collectibles.TryGetValue(cacheKey, out collectible))
+		{
+			AssetLocation code;
+
+			try { code = new AssetLocation(target.Code); }
+			catch (Exception exception)
+			{
+				error = $"Collectible Code '{target.Code}' is invalid: {exception.Message}";
+				return false;
+			}
+
+			collectible = target.Class == ImmDependencyCollectibleClass.Block ? Api.World.GetBlock(code) : Api.World.GetItem(code);
+			collectibles[cacheKey] = collectible;
+		}
+
+		if (collectible == null)
+		{
+			error = $"{target.Class} collectible '{target.Code}' was not found.";
+			return false;
+		}
+
+		error = "";
+		return true;
 	}
 
 	private bool TryEvaluateHasModID(ImmDependencyCriterion criterion, out bool matched, out string error)
@@ -202,8 +308,8 @@ public sealed class ImmDependencyService
 		try { current = config.SelectToken(target.Map); }
 		catch (Exception exception) { error = $"Invalid setting Map '{target.Map}': {exception.Message}"; return false; }
 
-		if (current == null) { error = $"Setting '{target.ConfigFile}' → '{target.Map}' was not found."; return false; }
-		if (current is JContainer || current.Type is JTokenType.Null or JTokenType.Undefined) { error = $"Setting '{target.ConfigFile}' → '{target.Map}' is not a primitive value."; return false; }
+		if (current == null) { error = $"Setting '{target.ConfigFile}' to '{target.Map}' was not found."; return false; }
+		if (current is JContainer || current.Type is JTokenType.Null or JTokenType.Undefined) { error = $"Setting '{target.ConfigFile}' to '{target.Map}' is not a primitive value."; return false; }
 
 		return TryCompare(current, criterion.Value!, criterion.Operator, out matched, out error);
 	}
@@ -291,7 +397,7 @@ public sealed class ImmDependencyService
 		try { current = config.SelectToken(target.Map); }
 		catch (Exception exception) { error = $"Invalid setting Map '{target.Map}': {exception.Message}"; return false; }
 
-		if (current == null) { error = $"Setting '{target.ConfigFile}' → '{target.Map}' was not found."; return false; }
+		if (current == null) { error = $"Setting '{target.ConfigFile}' to '{target.Map}' was not found."; return false; }
 
 		if (!TryNormalizeResolutionValue(current, resolution.Value!, out JToken normalized, out error)) { return false; }
 
