@@ -1,0 +1,18 @@
+{
+  "Type": "Code",
+  "Name": "Integrated Mod Manager",
+  "ModID": "integratedmodmanager",
+  "Version": "1.1.4",
+  "Description": "A utility mod for modders that provides an integrated in-game interface for configuring mods, checking dependencies and detecting or resolving mod conflicts.",
+  "Website": "https://github.com/HugoCortell/VS_IMM",
+  "Authors": [
+    "YangWenLi"
+  ],
+  "Contributors": [
+    "RodinPandarex"
+  ],
+  "Side": "Universal",
+  "RequiredOnClient": true,
+  "RequiredOnServer": true,
+  "Dependencies": {}
+}
